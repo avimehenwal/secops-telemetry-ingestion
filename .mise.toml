@@ -1,4 +1,5 @@
 [tools]
+air = "1.67.4"
 go = "1.26.6"
 
 [tasks.build-cli]
@@ -12,6 +13,10 @@ run = "go build -o bin/telemetryprocessor ./apps/telemetryprocessor/cmd/server"
 [tasks.run-processor]
 description = "Run the telemetry processor microservice"
 run = "go run ./apps/telemetryprocessor/cmd/server"
+
+[tasks.dev-processor]
+description = "Run the telemetry processor with hot reload (air)"
+run = "air -c .air.toml"
 
 [tasks.test]
 description = "Run all tests in the workspace"
