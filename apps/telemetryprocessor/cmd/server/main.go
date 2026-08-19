@@ -1,49 +1,53 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
-	"fmt"
+	"errors"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/avimehenwal/secops-telemetry-ingestion/apps/telemetryprocessor/internal/analytics"
 	"github.com/avimehenwal/secops-telemetry-ingestion/apps/telemetryprocessor/internal/api"
+	"github.com/avimehenwal/secops-telemetry-ingestion/apps/telemetryprocessor/internal/config"
 	"github.com/avimehenwal/secops-telemetry-ingestion/apps/telemetryprocessor/internal/enrichment"
 )
 
-func getenv(key, fallback string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return fallback
-}
-
 func main() {
-	addr := getenv("PROCESSOR_ADDR", ":8080")
-	enrichmentURL := getenv("ENRICHMENT_URL", "https://api.heyering.com/enrichment")
-	analyticsURL := getenv("ANALYTICS_URL", "https://api.heyering.com/analytics")
-	// Per docs/openapi.json, both upstream services authenticate via this
-	// static Authorization header value.
-	apiKey := getenv("EYE_API_KEY", "eye-am-hiring")
+	logger := log.New(os.Stdout, "", log.LstdFlags|log.LUTC)
+
+	cfg, err := config.Load()
+	if err != nil {
+		logger.Fatalf("configuration error: %v", err)
+	}
 
 	handler := &api.IngestHandler{
-		Enrichment: enrichment.NewClient(enrichmentURL, apiKey),
-		Analytics:  analytics.NewClient(analyticsURL, apiKey),
+		Enrichment: enrichment.NewClient(cfg.EnrichmentURL, cfg.APIKey, enrichment.Options{
+			Timeout:         cfg.EnrichmentTimeout,
+			MaxAttempts:     cfg.EnrichmentMaxAttempts,
+			BackoffBase:     cfg.EnrichmentBackoffBase,
+			BackoffMax:      cfg.EnrichmentBackoffMax,
+			BreakerTrip:     cfg.EnrichmentBreakerTrip,
+			BreakerCooldown: cfg.EnrichmentBreakerCooldown,
+		}),
+		Analytics: analytics.NewClient(cfg.AnalyticsURL, cfg.APIKey, analytics.Options{
+			Timeout:    cfg.AnalyticsTimeout,
+			BatchSize:  cfg.AnalyticsBatchSize,
+			RateLimit:  cfg.AnalyticsRateLimit,
+			RateWindow: cfg.AnalyticsRateWindow,
+			MaxRetries: cfg.AnalyticsMaxRetries,
+		}),
+		Logger: logger,
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/" {
-			http.NotFound(w, r)
-			return
-		}
-		fmt.Fprintln(w, "Hello from go world")
-	})
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(struct {
+		_ = json.NewEncoder(w).Encode(struct {
 			Status    string `json:"status"`
 			Timestamp string `json:"timestamp"`
 		}{
@@ -53,8 +57,33 @@ func main() {
 	})
 	mux.Handle("/ingest", handler)
 
-	log.Printf("telemetryprocessor listening on %s", addr)
-	if err := http.ListenAndServe(addr, mux); err != nil {
-		log.Fatal(err)
+	srv := &http.Server{
+		Addr:              cfg.Addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
 	}
+
+	// Run the server until a termination signal, then shut down gracefully so
+	// in-flight ingests (which can be slow due to the Analytics rate limit)
+	// are given a chance to finish.
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	go func() {
+		logger.Printf("telemetryprocessor listening on %s (enrichment=%s analytics=%s, rate=%d/%s)",
+			cfg.Addr, cfg.EnrichmentURL, cfg.AnalyticsURL, cfg.AnalyticsRateLimit, cfg.AnalyticsRateWindow)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			logger.Fatalf("server error: %v", err)
+		}
+	}()
+
+	<-ctx.Done()
+	logger.Println("shutdown signal received, draining connections...")
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		logger.Printf("graceful shutdown failed: %v", err)
+	}
+	logger.Println("stopped")
 }

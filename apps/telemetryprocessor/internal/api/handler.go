@@ -1,21 +1,28 @@
-// Package api implements the HTTP handler for the processor's single
-// ingest endpoint.
 package api
 
 import (
 	"encoding/json"
+	"log"
 	"net/http"
 
 	"github.com/avimehenwal/secops-telemetry-ingestion/apps/telemetryprocessor/internal/analytics"
+	"github.com/avimehenwal/secops-telemetry-ingestion/apps/telemetryprocessor/internal/category"
 	"github.com/avimehenwal/secops-telemetry-ingestion/apps/telemetryprocessor/internal/enrichment"
 	"github.com/avimehenwal/secops-telemetry-ingestion/apps/telemetryprocessor/internal/model"
 )
 
-// IngestHandler handles POST requests from the CLI containing records to
-// enrich and forward to the Analytics Service.
+const maxRecordErrors = 100
+
 type IngestHandler struct {
 	Enrichment *enrichment.Client
 	Analytics  *analytics.Client
+	Logger     *log.Logger
+}
+
+func (h *IngestHandler) logf(format string, args ...any) {
+	if h.Logger != nil {
+		h.Logger.Printf(format, args...)
+	}
 }
 
 func (h *IngestHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -26,14 +33,82 @@ func (h *IngestHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	var req model.IngestRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid request body", http.StatusBadRequest)
+		http.Error(w, "invalid request body: "+err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	// TODO: for each record, call h.Enrichment.Enrich, merge the result
-	// into a model.AnalyticsEvent, and forward batches to h.Analytics.Send.
-	// TODO: decide on partial-failure semantics (e.g. per-record status in
-	// the response) once enrichment/analytics failure modes are handled.
+	ctx := r.Context()
+	result := model.IngestResult{Received: len(req.Records)}
 
-	w.WriteHeader(http.StatusAccepted)
+	events := make([]model.AnalyticsEvent, 0, len(req.Records))
+	for _, rec := range req.Records {
+		cat, ok := category.Normalize(rec.Category)
+		if !ok {
+			result.FailedCategory++
+			h.addErr(&result, rec.ID, "category", "unrecognised category "+quote(rec.Category))
+			continue
+		}
+
+		details, err := h.Enrichment.Enrich(ctx, model.Logline{
+			ID:       rec.ID,
+			Asset:    rec.Asset,
+			IP:       rec.IP,
+			Category: cat,
+		})
+		if err != nil {
+			if ctx.Err() != nil {
+				h.logf("ingest aborted mid-enrichment: %v", ctx.Err())
+				break
+			}
+			result.FailedEnrichment++
+			h.addErr(&result, rec.ID, "enrichment", err.Error())
+			continue
+		}
+		result.Enriched++
+
+		events = append(events, model.AnalyticsEvent{
+			ID:            rec.ID,
+			Asset:         rec.Asset,
+			IP:            rec.IP,
+			Category:      details.Category,
+			ASN:           details.ASN,
+			CorrelationID: details.CorrelationID,
+		})
+	}
+
+	if len(events) > 0 {
+		ingested, err := h.Analytics.Send(ctx, events)
+		result.Ingested = ingested
+		if err != nil {
+			result.FailedAnalytics = len(events) - ingested
+			h.addErr(&result, 0, "analytics", err.Error())
+			h.logf("analytics send failed after %d/%d ingested: %v", ingested, len(events), err)
+		}
+	}
+
+	h.logf("ingest complete: received=%d enriched=%d ingested=%d failedCategory=%d failedEnrichment=%d failedAnalytics=%d",
+		result.Received, result.Enriched, result.Ingested, result.FailedCategory, result.FailedEnrichment, result.FailedAnalytics)
+
+	status := http.StatusOK
+	if result.Received > 0 && result.Ingested == 0 && result.Enriched == 0 {
+		status = http.StatusBadGateway
+	}
+	writeJSON(w, status, result)
+}
+
+func (h *IngestHandler) addErr(res *model.IngestResult, id int64, stage, reason string) {
+	if len(res.RecordErrors) >= maxRecordErrors {
+		return
+	}
+	res.RecordErrors = append(res.RecordErrors, model.RecordError{ID: id, Stage: stage, Reason: reason})
+}
+
+func writeJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+func quote(s string) string {
+	return `"` + s + `"`
 }
