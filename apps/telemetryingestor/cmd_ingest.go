@@ -15,15 +15,6 @@ import (
 	"github.com/avimehenwal/secops-telemetry-ingestion/apps/telemetryingestor/internal/filter"
 )
 
-// ingestRecord is the per-record shape sent to the processor. It mirrors the
-// processor's model.Record (id, asset, ip, category). We keep a local copy
-// rather than importing across the module boundary — the processor's model is
-// in an internal/ package of a different module and is not importable, and a
-// CLI owning its own wire contract is a reasonable seam anyway.
-//
-// Assumption: the processor is responsible for normalising the free-text
-// `category` to its Enrichment enum, so the CLI forwards it verbatim. `source`
-// and `created_utc` are not part of the processor contract and are dropped.
 type ingestRecord struct {
 	ID       int64  `json:"id,omitempty"`
 	Asset    string `json:"asset"`
@@ -41,10 +32,11 @@ func runIngest(args []string) int {
 	endpoint := fs.String("endpoint", defaultEndpoint, "processor ingest endpoint (env "+envEndpoint+")")
 	chunkSize := fs.Int("chunk-size", defaultChunkSize, "records to POST per request (env "+envChunkSize+")")
 	dryRun := fs.Bool("dry-run", false, "parse and filter but do not POST anything")
+	skipPreflight := fs.Bool("skip-preflight", false, "do not health-check the processor before ingesting")
 	var where stringSlice
 	fs.Var(&where, "where", "filter as column=value (exact) or column~value (contains); repeatable, ANDed")
 	fs.Usage = func() {
-		fmt.Fprintf(fs.Output(), "Ingest a telemetry CSV and POST records to the processor.\n\nUsage:\n  telemetryingestor ingest -file <path> [-endpoint <url>] [-chunk-size <n>] [-where <expr>] [-dry-run]\n\nFlags:\n")
+		fmt.Fprintf(fs.Output(), "Ingest a telemetry CSV and POST records to the processor.\n\nUsage:\n  telemetryingestor ingest -file <path> [-endpoint <url>] [-chunk-size <n>] [-where <expr>] [-dry-run] [-skip-preflight]\n\nFlags:\n")
 		fs.PrintDefaults()
 	}
 	if err := fs.Parse(args); err != nil {
@@ -70,6 +62,15 @@ func runIngest(args []string) int {
 		return 2
 	}
 
+	client := &http.Client{Timeout: 30 * time.Second}
+	if !*dryRun && !*skipPreflight {
+		probe := &http.Client{Timeout: defaultPreflightTimeout}
+		if err := checkProcessorUp(probe, resolvedEndpoint); err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			return 1
+		}
+	}
+
 	f, err := os.Open(*file)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
@@ -83,7 +84,6 @@ func runIngest(args []string) int {
 		return 1
 	}
 
-	// User feedback up front so the run is self-documenting.
 	fmt.Printf("Ingesting %s\n", *file)
 	fmt.Printf("  endpoint:   %s\n", resolvedEndpoint)
 	fmt.Printf("  chunk size: %d\n", resolvedChunk)
@@ -92,10 +92,13 @@ func runIngest(args []string) int {
 	}
 	if *dryRun {
 		fmt.Println("  mode:       dry-run (no records will be sent)")
+	} else if *skipPreflight {
+		fmt.Println("  mode:       pre-check skipped")
+	} else {
+		fmt.Println("  processor:  reachable and healthy")
 	}
 	fmt.Println()
 
-	client := &http.Client{Timeout: 30 * time.Second}
 	stats := ingestStats{}
 	batch := make([]ingestRecord, 0, resolvedChunk)
 
@@ -159,9 +162,6 @@ func runIngest(args []string) int {
 	return stats.report(*dryRun)
 }
 
-// toIngestRecord converts a CSV record to the wire shape, parsing the id. A
-// non-integer id is the one hard requirement that cannot be forwarded, so such
-// a record is rejected (reported by the caller).
 func toIngestRecord(r icsv.Record) (ingestRecord, bool) {
 	id, err := strconv.ParseInt(r.ID, 10, 64)
 	if err != nil {
@@ -175,7 +175,6 @@ func toIngestRecord(r icsv.Record) (ingestRecord, bool) {
 	}, true
 }
 
-// postChunk POSTs one batch of records and treats any non-2xx as a failure.
 func postChunk(client *http.Client, endpoint string, records []ingestRecord) error {
 	body, err := json.Marshal(ingestRequest{Records: records})
 	if err != nil {
@@ -200,7 +199,6 @@ func postChunk(client *http.Client, endpoint string, records []ingestRecord) err
 	return nil
 }
 
-// ingestStats accumulates counters for end-of-run feedback.
 type ingestStats struct {
 	read             int
 	filteredOut      int
@@ -211,7 +209,6 @@ type ingestStats struct {
 	failedChunks     int
 }
 
-// report prints a summary and returns the process exit code.
 func (s ingestStats) report(dryRun bool) int {
 	fmt.Println("\nSummary:")
 	fmt.Printf("  rows read:          %d\n", s.read)
