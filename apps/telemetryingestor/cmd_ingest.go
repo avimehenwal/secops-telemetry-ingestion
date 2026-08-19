@@ -102,18 +102,20 @@ func runIngest(args []string) int {
 
 	stats := ingestStats{}
 	batch := make([]ingestRecord, 0, resolvedChunk)
+	chunkNum := 0
 
 	flush := func() {
 		if len(batch) == 0 {
 			return
 		}
+		chunkNum++
 		if err := send(batch); err != nil {
 			stats.failedChunks++
 			stats.failedRecords += len(batch)
-			fmt.Fprintf(os.Stderr, "  chunk failed (%d records): %v\n", len(batch), err)
+			fmt.Fprintf(os.Stderr, "  chunk %d failed (%d records): %v\n", chunkNum, len(batch), err)
 		} else {
 			stats.sent += len(batch)
-			fmt.Printf("  %s %d records (%d total)\n", verb, len(batch), stats.sent)
+			fmt.Printf("  chunk %d: %s %d records (%d total)\n", chunkNum, verb, len(batch), stats.sent)
 		}
 		batch = batch[:0]
 	}
@@ -212,21 +214,27 @@ type ingestStats struct {
 	failedChunks     int
 }
 
+const statLabelWidth = 21
+
+func printStat(label string, value int) {
+	fmt.Printf("  %-*s%d\n", statLabelWidth, label, value)
+}
+
 func (s ingestStats) report(verb string) int {
 	fmt.Println("\nSummary:")
-	fmt.Printf("  rows read:          %d\n", s.read)
+	printStat("rows read:", s.read)
 	if s.filteredOut > 0 {
-		fmt.Printf("  filtered out:       %d\n", s.filteredOut)
+		printStat("filtered out:", s.filteredOut)
 	}
 	if s.skippedMalformed > 0 {
-		fmt.Printf("  skipped (malformed): %d\n", s.skippedMalformed)
+		printStat("skipped (malformed):", s.skippedMalformed)
 	}
 	if s.skippedInvalid > 0 {
-		fmt.Printf("  skipped (bad id):   %d\n", s.skippedInvalid)
+		printStat("skipped (bad id):", s.skippedInvalid)
 	}
-	fmt.Printf("  %-18s%d\n", verb+":", s.sent)
+	printStat(verb+":", s.sent)
 	if s.failedRecords > 0 {
-		fmt.Printf("  failed:             %d records in %d chunk(s)\n", s.failedRecords, s.failedChunks)
+		fmt.Printf("  %-*s%d records in %d chunk(s)\n", statLabelWidth, "failed:", s.failedRecords, s.failedChunks)
 		return 1
 	}
 	return 0

@@ -220,7 +220,7 @@ func TestIngestFailsWhenProcessorRejects(t *testing.T) {
 	if got.code == 0 {
 		t.Fatalf("exit code = 0, want non-zero on a failed chunk\nstdout: %s", got.stdout)
 	}
-	if !strings.Contains(got.stderr, "chunk failed") {
+	if !strings.Contains(got.stderr, "chunk 1 failed") {
 		t.Errorf("stderr does not report the failed chunk:\n%s", got.stderr)
 	}
 }
@@ -357,7 +357,7 @@ func TestSkipPreflightAttemptsIngestAnyway(t *testing.T) {
 	if strings.Contains(got.stderr, "pre-check failed") {
 		t.Errorf("-skip-preflight did not skip the pre-check:\n%s", got.stderr)
 	}
-	if !strings.Contains(got.stderr, "chunk failed") {
+	if !strings.Contains(got.stderr, "chunk 1 failed") {
 		t.Errorf("expected the ingest to be attempted and fail per chunk:\n%s", got.stderr)
 	}
 }
