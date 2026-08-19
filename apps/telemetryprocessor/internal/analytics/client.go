@@ -1,5 +1,3 @@
-// Package analytics is a client for the Analytics Service
-// (docs/openapi.json, POST /analytics).
 package analytics
 
 import (
@@ -16,10 +14,8 @@ import (
 	"github.com/avimehenwal/secops-telemetry-ingestion/apps/telemetryprocessor/internal/ratelimit"
 )
 
-// UpstreamMaxBatchSize is the hard maximum number of events the Analytics
 const UpstreamMaxBatchSize = 20
 
-// Options configures a Client.
 type Options struct {
 	Timeout    time.Duration // per-attempt HTTP timeout
 	BatchSize  int           // max events per request (clamped to UpstreamMaxBatchSize)
@@ -28,7 +24,6 @@ type Options struct {
 	MaxRetries int           // retries on HTTP 429
 }
 
-// Client sends enriched events to the Analytics Service.
 type Client struct {
 	baseURL   string
 	apiKey    string
@@ -38,7 +33,6 @@ type Client struct {
 	limiter   *ratelimit.Bucket
 }
 
-// NewClient constructs an analytics Client with a shared rate limiter.
 func NewClient(baseURL, apiKey string, opts Options) *Client {
 	batch := opts.BatchSize
 	if batch < 1 || batch > UpstreamMaxBatchSize {
@@ -123,8 +117,6 @@ func (c *Client) postOnce(ctx context.Context, body []byte, count int) (n int, r
 	case resp.StatusCode == http.StatusOK:
 		var out model.AnalyticsSuccessResponse
 		if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-			// The batch was accepted (200) but we could not parse the count;
-			// assume all items ingested rather than double-sending.
 			return count, -1, nil
 		}
 		return int(out.ItemsIngested), 0, nil

@@ -28,6 +28,39 @@ actionable feedback:
   (e.g. Enrichment Service down); the CLI exits non-zero.
 - **400** — malformed request body. **405** — non-POST.
 
+```bash
+# normal ingest
+curl -sS -X POST http://localhost:8080/ingest \
+  -H 'Content-Type: application/json' \
+  -d '{"records":[{"id":1,"asset":"a","ip":"1.2.3.4","category":"phising"}]}'
+
+# liveness/readiness probe
+curl -sS http://localhost:8080/health
+```
+
+### Dry-run
+
+Add `?dry-run=true` to `/ingest` to **validate records without calling the
+Enrichment or Analytics microservices**. Categories are still normalised
+(so bad categories are still reported), but nothing is enriched or forwarded
+downstream — useful for checking a payload, smoke-testing a deploy, or
+exercising the ingest path with zero side effects.
+
+```bash
+# dry-run: validate only, no downstream calls
+curl -sS -X POST 'http://localhost:8080/ingest?dry-run=true' \
+  -H 'Content-Type: application/json' \
+  -d '{"records":[{"id":1,"asset":"a","ip":"1.2.3.4","category":"phising"}]}'
+```
+
+Accepted truthy values: `1`, `true` (any case), `yes`. The response echoes the
+mode and reports how many records *would* have been sent as `ingested`
+(`enriched` stays `0`, and a zero-enriched dry-run stays **200**, never `502`):
+
+```json
+{ "received": 1, "enriched": 0, "ingested": 1, "failedCategory": 0, "dryRun": true }
+```
+
 ## Processing pipeline
 
 For each record:

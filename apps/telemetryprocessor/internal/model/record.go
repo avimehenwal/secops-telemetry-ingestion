@@ -46,6 +46,8 @@ type IngestResult struct {
 	FailedCategory   int           `json:"failedCategory"`
 	FailedAnalytics  int           `json:"failedAnalytics"`
 	RecordErrors     []RecordError `json:"recordErrors,omitempty"`
+
+	DryRun bool `json:"dryRun,omitempty"`
 }
 
 type RecordError struct {

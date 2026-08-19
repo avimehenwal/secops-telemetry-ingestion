@@ -120,6 +120,42 @@ func TestHandlerEnrichmentFailureReported(t *testing.T) {
 	}
 }
 
+func TestHandlerDryRunSkipsMicroservices(t *testing.T) {
+	enrichSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("enrichment must not be called in dry-run mode")
+	}))
+	defer enrichSrv.Close()
+	analyticsSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("analytics must not be called in dry-run mode")
+	}))
+	defer analyticsSrv.Close()
+
+	h := newHandler(enrichSrv.URL, analyticsSrv.URL)
+	body, _ := json.Marshal(model.IngestRequest{Records: []model.Record{
+		{ID: 1, Asset: "a", IP: "1.2.3.4", Category: "phising"},       // valid -> would ingest
+		{ID: 2, Asset: "b", IP: "5.6.7.8", Category: "totally-bogus"}, // bad category
+	}})
+	r := httptest.NewRequest(http.MethodPost, "/ingest?dry-run=true", bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+
+	var res model.IngestResult
+	_ = json.Unmarshal(w.Body.Bytes(), &res)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	if !res.DryRun {
+		t.Fatalf("expected DryRun=true in result: %+v", res)
+	}
+	if res.Received != 2 || res.Ingested != 1 || res.FailedCategory != 1 {
+		t.Fatalf("unexpected result: %+v", res)
+	}
+	if res.Enriched != 0 {
+		t.Fatalf("nothing should be enriched in dry-run, got %d", res.Enriched)
+	}
+}
+
 func TestHandlerRejectsNonPost(t *testing.T) {
 	h := newHandler("http://unused", "http://unused")
 	r := httptest.NewRequest(http.MethodGet, "/ingest", nil)

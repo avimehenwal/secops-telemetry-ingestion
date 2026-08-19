@@ -37,8 +37,10 @@ func (h *IngestHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	dryRun := isDryRun(r)
+
 	ctx := r.Context()
-	result := model.IngestResult{Received: len(req.Records)}
+	result := model.IngestResult{Received: len(req.Records), DryRun: dryRun}
 
 	events := make([]model.AnalyticsEvent, 0, len(req.Records))
 	for _, rec := range req.Records {
@@ -46,6 +48,11 @@ func (h *IngestHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if !ok {
 			result.FailedCategory++
 			h.addErr(&result, rec.ID, "category", "unrecognised category "+quote(rec.Category))
+			continue
+		}
+
+		if dryRun {
+			result.Ingested++
 			continue
 		}
 
@@ -76,7 +83,7 @@ func (h *IngestHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	if len(events) > 0 {
+	if len(events) > 0 && !dryRun {
 		ingested, err := h.Analytics.Send(ctx, events)
 		result.Ingested = ingested
 		if err != nil {
@@ -86,14 +93,23 @@ func (h *IngestHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	h.logf("ingest complete: received=%d enriched=%d ingested=%d failedCategory=%d failedEnrichment=%d failedAnalytics=%d",
-		result.Received, result.Enriched, result.Ingested, result.FailedCategory, result.FailedEnrichment, result.FailedAnalytics)
+	h.logf("ingest complete: dryRun=%t received=%d enriched=%d ingested=%d failedCategory=%d failedEnrichment=%d failedAnalytics=%d",
+		result.DryRun, result.Received, result.Enriched, result.Ingested, result.FailedCategory, result.FailedEnrichment, result.FailedAnalytics)
 
 	status := http.StatusOK
-	if result.Received > 0 && result.Ingested == 0 && result.Enriched == 0 {
+	if !dryRun && result.Received > 0 && result.Ingested == 0 && result.Enriched == 0 {
 		status = http.StatusBadGateway
 	}
 	writeJSON(w, status, result)
+}
+
+func isDryRun(r *http.Request) bool {
+	switch r.URL.Query().Get("dry-run") {
+	case "1", "true", "TRUE", "True", "yes":
+		return true
+	default:
+		return false
+	}
 }
 
 func (h *IngestHandler) addErr(res *model.IngestResult, id int64, stage, reason string) {

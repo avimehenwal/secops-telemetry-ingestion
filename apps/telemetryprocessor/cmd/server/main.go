@@ -63,9 +63,6 @@ func main() {
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
-	// Run the server until a termination signal, then shut down gracefully so
-	// in-flight ingests (which can be slow due to the Analytics rate limit)
-	// are given a chance to finish.
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
