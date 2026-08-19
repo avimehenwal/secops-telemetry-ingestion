@@ -34,3 +34,5 @@ go.work.sum
 /bin/
 *.log
 .DS_Store
+docs/DESIGN.md
+docs/TechAssessment.pdf

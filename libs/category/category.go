@@ -1,3 +1,14 @@
+/*
+Package category canonicalises the free-text `category` column of a telemetry
+CSV into the enum the Enrichment Service accepts (see /enrichment in
+docs/openapi.json).
+
+It is a shared module rather than an internal package of either app because
+both need the *same* answer for different reasons: the processor uses it to
+decide what to send upstream, and the CLI's `validate` uses it to warn that
+"the processor will drop this record". That warning is only true while the two
+alias tables agree, so keeping one copy is a correctness requirement, not tidiness.
+*/
 package category
 
 import "strings"

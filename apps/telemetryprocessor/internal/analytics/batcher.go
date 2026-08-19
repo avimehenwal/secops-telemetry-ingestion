@@ -2,6 +2,7 @@ package analytics
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/avimehenwal/secops-telemetry-ingestion/apps/telemetryprocessor/internal/model"
@@ -126,6 +127,20 @@ func (b *Batcher) flush(ctx context.Context, pending []submission) {
 	}
 
 	ingested, err := b.send(ctx, events)
+
+	/*
+		A 200 is not a receipt. The Analytics Service answers with a count
+		(itemsIngested), and that count is allowed to be lower than what we
+		sent. Treating a short count as success is how a mission-critical
+		pipeline quietly loses records, so the shortfall becomes an error.
+
+		The service reports *how many* landed, never *which*, so attributing
+		the shortfall to the tail of the batch is a convention, not a fact. It
+		is the count that reaches the operator, and the count is right.
+	*/
+	if err == nil && ingested < len(pending) {
+		err = fmt.Errorf("analytics accepted only %d of %d events", ingested, len(pending))
+	}
 
 	for i, s := range pending {
 		if err != nil && i >= ingested {

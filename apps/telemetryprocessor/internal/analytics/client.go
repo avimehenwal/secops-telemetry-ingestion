@@ -72,7 +72,9 @@ func (c *Client) SendBatch(ctx context.Context, batch []model.AnalyticsEvent) (i
 		}
 		lastErr = err
 		if retryAfter < 0 {
-			return 0, err
+			// Permanent: return n as well as the error, because a partial
+			// success still tells the caller which events it need not mourn.
+			return n, err
 		}
 		if attempt < c.maxRetry {
 			if err := sleep(ctx, retryAfter); err != nil {
@@ -101,7 +103,16 @@ func (c *Client) postOnce(ctx context.Context, body []byte, count int) (n int, r
 	case resp.StatusCode == http.StatusOK:
 		var out model.AnalyticsSuccessResponse
 		if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+			// A 200 we cannot parse: assume the batch landed. Retrying would
+			// duplicate events upstream, which is worse than an optimistic count.
 			return count, -1, nil
+		}
+		if out.Status == "error" {
+			// 200 + status=error is the service telling us the batch was not
+			// (fully) stored. Not retryable: a replay would duplicate whatever
+			// itemsIngested does cover.
+			return int(out.ItemsIngested), -1, fmt.Errorf(
+				"analytics reported status=error (%d of %d items ingested)", out.ItemsIngested, count)
 		}
 		return int(out.ItemsIngested), 0, nil
 	case resp.StatusCode == http.StatusTooManyRequests:

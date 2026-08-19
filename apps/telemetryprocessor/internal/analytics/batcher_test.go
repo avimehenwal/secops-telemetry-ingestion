@@ -166,3 +166,27 @@ func TestBatcherDrainsQueueOnShutdown(t *testing.T) {
 		t.Errorf("delivered %d records across %v, want 5", total, rec.batches())
 	}
 }
+
+// The Analytics Service answers 200 with a count, and that count may be short.
+// Reporting the shortfall as success is silent data loss.
+func TestBatcherReportsShortIngestCountAsFailure(t *testing.T) {
+	rec := &recorder{n: 1} // 200 OK, but only 1 of 3 items stored
+	b := runBatcher(t, rec, BatcherOptions{BatchSize: 3, MaxDelay: 20 * time.Millisecond})
+
+	results := make([]<-chan error, 0, 3)
+	for i := 0; i < 3; i++ {
+		results = append(results, b.Submit(context.Background(), model.AnalyticsEvent{ID: int64(i)}))
+	}
+
+	var ok, failed int
+	for _, r := range results {
+		if err := <-r; err != nil {
+			failed++
+		} else {
+			ok++
+		}
+	}
+	if ok != 1 || failed != 2 {
+		t.Fatalf("upstream stored 1 of 3: got ok=%d failed=%d, want ok=1 failed=2", ok, failed)
+	}
+}

@@ -32,8 +32,8 @@ Commands:
 Run "telemetryingestor <command> -h" for command-specific flags.
 
 Environment:
-  EYESECURITY_ENDPOINT     alternative to -endpoint (ingest); -endpoint wins if both set
-  EYESECURITY_CHUNK_SIZE   alternative to -chunk-size (ingest); -chunk-size wins if both set
+  EYESECURITY_ENDPOINT   alternative to -endpoint (ingest); -endpoint wins if both set
+  EYESECURITY_TIMEOUT    alternative to -timeout (ingest); -timeout wins if both set
 `
 
 func main() {

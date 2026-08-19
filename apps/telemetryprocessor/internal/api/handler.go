@@ -6,9 +6,9 @@ import (
 	"net/http"
 
 	"github.com/avimehenwal/secops-telemetry-ingestion/apps/telemetryprocessor/internal/analytics"
-	"github.com/avimehenwal/secops-telemetry-ingestion/apps/telemetryprocessor/internal/category"
 	"github.com/avimehenwal/secops-telemetry-ingestion/apps/telemetryprocessor/internal/enrichment"
 	"github.com/avimehenwal/secops-telemetry-ingestion/apps/telemetryprocessor/internal/model"
+	"github.com/avimehenwal/secops-telemetry-ingestion/libs/category"
 )
 
 const maxRecordErrors = 100
@@ -106,11 +106,29 @@ func (h *IngestHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.logf("ingest complete: dryRun=%t received=%d enriched=%d ingested=%d failedCategory=%d failedEnrichment=%d failedAnalytics=%d",
 		result.DryRun, result.Received, result.Enriched, result.Ingested, result.FailedCategory, result.FailedEnrichment, result.FailedAnalytics)
 
-	status := http.StatusOK
-	if !dryRun && result.Received > 0 && result.Ingested == 0 && result.Enriched == 0 {
-		status = http.StatusBadGateway
+	writeJSON(w, statusFor(result, dryRun), result)
+}
+
+/*
+statusFor decides between "the run happened, read the counts" and "our
+dependencies failed us".
+
+502 has to mean the latter, so it is judged only on records that actually
+reached an upstream service. A record rejected at the category stage never left
+this process: a payload of nothing but unrecognised categories is a problem
+with the CSV, and answering 502 would send the operator to check the Enrichment
+Service instead of their own data. Those runs are a 200 whose counts say
+failedCategory.
+*/
+func statusFor(res model.IngestResult, dryRun bool) int {
+	if dryRun {
+		return http.StatusOK
 	}
-	writeJSON(w, status, result)
+	attempted := res.Received - res.FailedCategory
+	if attempted > 0 && res.Ingested == 0 {
+		return http.StatusBadGateway
+	}
+	return http.StatusOK
 }
 
 func isDryRun(r *http.Request) bool {

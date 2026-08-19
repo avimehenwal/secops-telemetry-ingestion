@@ -102,6 +102,11 @@ func (c Config) validate() error {
 		return fmt.Errorf("ANALYTICS_RATE_REQUESTS must be >= 1, got %d", c.AnalyticsRateRequest)
 	case c.AnalyticsRateWindow <= 0:
 		return fmt.Errorf("ANALYTICS_RATE_WINDOW must be > 0, got %s", c.AnalyticsRateWindow)
+	// A negative retry budget would skip the send loop entirely and report a
+	// failure with no underlying cause, which is a confusing way to find out
+	// about a typo in an env var.
+	case c.AnalyticsMaxRetries < 0:
+		return fmt.Errorf("ANALYTICS_MAX_RETRIES must be >= 0, got %d", c.AnalyticsMaxRetries)
 	}
 	return nil
 }

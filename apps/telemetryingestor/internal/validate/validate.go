@@ -7,8 +7,8 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/avimehenwal/secops-telemetry-ingestion/apps/telemetryingestor/internal/category"
 	"github.com/avimehenwal/secops-telemetry-ingestion/apps/telemetryingestor/internal/csv"
+	"github.com/avimehenwal/secops-telemetry-ingestion/libs/category"
 )
 
 const dateLayout = "02/01/2006 15:04"

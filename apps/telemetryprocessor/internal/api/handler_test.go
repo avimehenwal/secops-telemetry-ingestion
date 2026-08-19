@@ -189,3 +189,52 @@ func TestHandlerRejectsBadJSON(t *testing.T) {
 		t.Fatalf("status = %d, want 400", w.Code)
 	}
 }
+
+// A payload whose records are all unrecognised categories is a bad CSV, not a
+// broken dependency. 502 would point the operator at the Enrichment Service.
+func TestHandlerAllBadCategoriesIsNotBadGateway(t *testing.T) {
+	unreachable := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("no upstream should be called when every category is unrecognised")
+	}))
+	defer unreachable.Close()
+
+	h := newHandler(t, unreachable.URL, unreachable.URL)
+	w, res := post(t, h, model.IngestRequest{Records: []model.Record{
+		{ID: 1, Asset: "a", IP: "1.2.3.4", Category: "cryptomining"},
+		{ID: 2, Asset: "b", IP: "5.6.7.8", Category: "gibberish"},
+	}})
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (the data is bad, the pipeline is fine)", w.Code)
+	}
+	if res.FailedCategory != 2 || res.Ingested != 0 {
+		t.Fatalf("unexpected result: %+v", res)
+	}
+}
+
+// The opposite case still has to fail loudly: records reached Analytics and
+// none of them stuck.
+func TestHandlerAnalyticsTotalFailureIsBadGateway(t *testing.T) {
+	enrichSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var in model.Logline
+		_ = json.NewDecoder(r.Body).Decode(&in)
+		_ = json.NewEncoder(w).Encode(model.EnrichmentDetails{ASN: "ASN1", Category: "T1566", CorrelationID: in.ID})
+	}))
+	defer enrichSrv.Close()
+	analyticsSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer analyticsSrv.Close()
+
+	h := newHandler(t, enrichSrv.URL, analyticsSrv.URL)
+	w, res := post(t, h, model.IngestRequest{Records: []model.Record{
+		{ID: 1, Asset: "a", IP: "1.2.3.4", Category: "phishing"},
+	}})
+
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", w.Code)
+	}
+	if res.Enriched != 1 || res.Ingested != 0 || res.FailedAnalytics != 1 {
+		t.Fatalf("unexpected result: %+v", res)
+	}
+}

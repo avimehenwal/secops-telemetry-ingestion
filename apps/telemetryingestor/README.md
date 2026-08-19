@@ -70,7 +70,7 @@ Ingesting docs/example_data_2.csv
   done
 
 Summary:
-  rows read:            998
+  rows read:            999
   filtered out:         802
   skipped (malformed):  1
   sent:                 196

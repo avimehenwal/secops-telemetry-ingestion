@@ -20,4 +20,8 @@ run = "air -c .air.toml"
 
 [tasks.test]
 description = "Run all tests in the workspace"
-run = "go test ./apps/telemetryingestor/... ./apps/telemetryprocessor/..."
+run = "go test $(go list -m -f '{{.Dir}}/...')"
+
+[tasks.vet]
+description = "Vet all modules in the workspace"
+run = "go vet $(go list -m -f '{{.Dir}}/...')"

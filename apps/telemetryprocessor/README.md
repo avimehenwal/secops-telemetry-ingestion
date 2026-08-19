@@ -24,9 +24,17 @@ actionable feedback:
 ```
 
 - **200** — the run completed (fully or partially); the counts tell the story.
-- **502** — records were supplied but nothing could be enriched/forwarded
-  (e.g. Enrichment Service down); the CLI exits non-zero.
+  This includes a payload whose records were *all* rejected for an unrecognised
+  category: that is a problem with the CSV, not with a dependency.
+- **502** — records actually reached an upstream service and **none** of them
+  landed (e.g. Enrichment Service down, or Analytics rejecting everything); the
+  CLI exits non-zero. Records dropped at the category stage are excluded from
+  this judgement, so a bad CSV never sends the operator hunting a healthy service.
 - **400** — malformed request body. **405** — non-POST.
+
+`/ingest` is unauthenticated: per the assessment brief, authn/authz of our own
+API is out of scope. In production this would sit behind the same gateway auth
+as the rest of the estate.
 
 ```bash
 # normal ingest
@@ -68,7 +76,7 @@ For each record:
 1. **Normalise category.** The CSV `category` is free text with inconsistent
    casing, punctuation and typos (`phising`, `explaoit-public facing`,
    `valida_accounts`, `compromise (driveby)`). It is canonicalised to the
-   Enrichment enum (see `internal/category`). Unrecognised values are reported
+   Enrichment enum (see `libs/category`, shared with the CLI). Unrecognised values are reported
    and skipped rather than sent (which would 400).
 2. **Enrich.** Call the Enrichment Service. Its ASN, MITRE category handle and
    correlation id are required to build the Analytics event, so a record that
@@ -89,7 +97,14 @@ For each record:
   A partial batch is flushed after `ANALYTICS_BATCH_DELAY` rather than being
   stranded. Every *request* — including 429 retries — is gated through a
   **shared token-bucket limiter**. `429` responses are retried, honouring
-  `Retry-After`.
+  `Retry-After` (the live service returns `Retry-After: 10`).
+- **A 200 from Analytics is not a receipt.** The response carries an
+  `itemsIngested` count that is allowed to be lower than what we sent, and a
+  `status` that can be `error`. Both are treated as a per-record failure for the
+  shortfall rather than being rounded up to success — otherwise a
+  mission-critical pipeline reports "ingested 999" while quietly losing records.
+  The service says *how many* landed, never *which*, so the shortfall is
+  attributed to the tail of the batch; the count is what reaches the operator.
 
 ## Configuration
 

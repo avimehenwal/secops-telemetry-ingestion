@@ -179,6 +179,9 @@ func readRecords(path string, flt filter.Filter, stats *ingestStats) ([]ingestRe
 		if err == io.EOF {
 			break
 		}
+		// Every row the reader hands back counts as read, malformed included,
+		// so the summary adds up: read == filtered + skipped + sent.
+		stats.read++
 		if err != nil {
 			if _, ok := err.(*icsv.FieldCountError); ok {
 				stats.skippedMalformed++
@@ -186,7 +189,6 @@ func readRecords(path string, flt filter.Filter, stats *ingestStats) ([]ingestRe
 			}
 			return nil, err
 		}
-		stats.read++
 
 		if !flt.Match(rec) {
 			stats.filteredOut++
