@@ -62,7 +62,8 @@ func runIngest(args []string) int {
 		return 2
 	}
 
-	client := &http.Client{Timeout: 30 * time.Second}
+	send, verb := chunkSender(*dryRun, &http.Client{Timeout: 30 * time.Second}, resolvedEndpoint)
+
 	if !*dryRun && !*skipPreflight {
 		probe := &http.Client{Timeout: defaultPreflightTimeout}
 		if err := checkProcessorUp(probe, resolvedEndpoint); err != nil {
@@ -102,26 +103,19 @@ func runIngest(args []string) int {
 	stats := ingestStats{}
 	batch := make([]ingestRecord, 0, resolvedChunk)
 
-	flush := func() bool {
+	flush := func() {
 		if len(batch) == 0 {
-			return true
+			return
 		}
-		if *dryRun {
-			fmt.Printf("  [dry-run] would send %d records\n", len(batch))
-			stats.sent += len(batch)
-			batch = batch[:0]
-			return true
-		}
-		if err := postChunk(client, resolvedEndpoint, batch); err != nil {
+		if err := send(batch); err != nil {
 			stats.failedChunks++
 			stats.failedRecords += len(batch)
 			fmt.Fprintf(os.Stderr, "  chunk failed (%d records): %v\n", len(batch), err)
 		} else {
 			stats.sent += len(batch)
-			fmt.Printf("  sent %d records (%d total)\n", len(batch), stats.sent)
+			fmt.Printf("  %s %d records (%d total)\n", verb, len(batch), stats.sent)
 		}
 		batch = batch[:0]
-		return true
 	}
 
 	for {
@@ -159,7 +153,16 @@ func runIngest(args []string) int {
 	}
 	flush()
 
-	return stats.report(*dryRun)
+	return stats.report(verb)
+}
+
+func chunkSender(dryRun bool, client *http.Client, endpoint string) (send func([]ingestRecord) error, verb string) {
+	if dryRun {
+		return func([]ingestRecord) error { return nil }, "would send"
+	}
+	return func(batch []ingestRecord) error {
+		return postChunk(client, endpoint, batch)
+	}, "sent"
 }
 
 func toIngestRecord(r icsv.Record) (ingestRecord, bool) {
@@ -209,7 +212,7 @@ type ingestStats struct {
 	failedChunks     int
 }
 
-func (s ingestStats) report(dryRun bool) int {
+func (s ingestStats) report(verb string) int {
 	fmt.Println("\nSummary:")
 	fmt.Printf("  rows read:          %d\n", s.read)
 	if s.filteredOut > 0 {
@@ -221,11 +224,7 @@ func (s ingestStats) report(dryRun bool) int {
 	if s.skippedInvalid > 0 {
 		fmt.Printf("  skipped (bad id):   %d\n", s.skippedInvalid)
 	}
-	if dryRun {
-		fmt.Printf("  would send:         %d\n", s.sent)
-		return 0
-	}
-	fmt.Printf("  sent:               %d\n", s.sent)
+	fmt.Printf("  %-18s%d\n", verb+":", s.sent)
 	if s.failedRecords > 0 {
 		fmt.Printf("  failed:             %d records in %d chunk(s)\n", s.failedRecords, s.failedChunks)
 		return 1

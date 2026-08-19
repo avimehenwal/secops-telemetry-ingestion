@@ -1,18 +1,7 @@
-// Package filter implements a small, column-oriented predicate language for
-// selecting which CSV records to ingest.
-//
-// Design goals (kept deliberately simple, per the assessment's "simple CSV
-// filter" wording):
-//   - Address any column by name, so the filter is not hard-coded to
-//     `category` and survives schema tweaks.
-//   - Two operators that cover the realistic use cases for this messy data:
-//     `=`  exact match (case-insensitive)
-//     `~`  substring/contains match (case-insensitive)
-//   - Multiple predicates are ANDed together, which is the intuitive
-//     "narrow down" behaviour for a CLI: -where source=defender -where category~phis
-//
-// Case-insensitivity matters here specifically because the sample data has
-// inconsistent casing (e.g. "phising" vs "Phising").
+/*
+Package filter implements a small, column-oriented predicate language for
+selecting which CSV records to ingest.
+*/
 package filter
 
 import (
@@ -47,8 +36,10 @@ func (p predicate) match(r csv.Record) bool {
 	}
 }
 
-// Filter is a conjunction (AND) of predicates. The zero value matches every
-// record, which is the natural "no filter supplied" behaviour.
+/*
+Filter is a conjunction (AND) of predicates. The zero value matches every
+record, which is the natural "no filter supplied" behaviour.
+*/
 type Filter struct {
 	preds []predicate
 }
@@ -56,7 +47,6 @@ type Filter struct {
 // Empty reports whether the filter has no predicates (matches everything).
 func (f Filter) Empty() bool { return len(f.preds) == 0 }
 
-// Match reports whether the record satisfies every predicate.
 func (f Filter) Match(r csv.Record) bool {
 	for _, p := range f.preds {
 		if !p.match(r) {
@@ -66,9 +56,11 @@ func (f Filter) Match(r csv.Record) bool {
 	return true
 }
 
-// Parse builds a Filter from expressions of the form "column=value" or
-// "column~value". Unknown columns are rejected up front so the user gets a
-// clear error instead of a filter that silently matches nothing.
+/*
+Parse builds a Filter from expressions of the form "column=value" or
+"column~value". Unknown columns are rejected up front so the user gets a
+clear error instead of a filter that silently matches nothing.
+*/
 func Parse(exprs []string) (Filter, error) {
 	var f Filter
 	for _, expr := range exprs {
@@ -89,8 +81,10 @@ func Parse(exprs []string) (Filter, error) {
 }
 
 func parseOne(expr string) (predicate, error) {
-	// '~' is checked before '=' only matters if both appear; we split on the
-	// first operator character encountered so values may contain the other.
+	/*
+		'~' is checked before '=' only matters if both appear; we split on the
+		first operator character encountered so values may contain the other.
+	*/
 	if i := strings.IndexByte(expr, '~'); i >= 0 && !containsBefore(expr, '=', i) {
 		return predicate{
 			column: strings.TrimSpace(expr[:i]),
@@ -108,7 +102,6 @@ func parseOne(expr string) (predicate, error) {
 	return predicate{}, fmt.Errorf("invalid filter %q: expected \"column=value\" or \"column~value\"", expr)
 }
 
-// containsBefore reports whether byte b occurs in s before index n.
 func containsBefore(s string, b byte, n int) bool {
 	i := strings.IndexByte(s, b)
 	return i >= 0 && i < n

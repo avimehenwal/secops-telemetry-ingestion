@@ -1,14 +1,16 @@
-// Command telemetryingestor ingests a secOps telemetry CSV file and forwards
-// the records to the telemetryprocessor microservice.
-//
-// It is organised as a small set of subcommands:
-//
-//	ingest    read a CSV, optionally filter it, and POST records to the processor
-//	validate  parse a CSV and report structural/semantic problems
-//	filter    apply a filter and print the matching rows back out as CSV
-//
-// Configuration precedence for shared settings is: CLI flag > environment
-// variable > built-in default. See config.go.
+/*
+Command telemetryingestor ingests a secOps telemetry CSV file and forwards
+the records to the telemetryprocessor microservice.
+
+It is organised as a small set of subcommands:
+
+	ingest    read a CSV, optionally filter it, and POST records to the processor
+	validate  parse a CSV and report structural/semantic problems
+	filter    apply a filter and print the matching rows back out as CSV
+
+Configuration precedence for shared settings is: CLI flag > environment
+variable > built-in default. See config.go.
+*/
 package main
 
 import (
@@ -38,9 +40,6 @@ func main() {
 	os.Exit(dispatch(os.Args[1:]))
 }
 
-// dispatch routes to the requested subcommand and returns a process exit code.
-// Keeping this as a pure func(args) int makes the whole CLI testable without
-// spawning a process.
 func dispatch(args []string) int {
 	if len(args) == 0 {
 		fmt.Fprint(os.Stderr, rootUsage)

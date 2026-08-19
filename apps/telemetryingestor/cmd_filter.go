@@ -48,10 +48,8 @@ func runFilter(args []string) int {
 		return 1
 	}
 
-	// Write matching rows back out as a well-formed CSV (comma-delimited, with
-	// a header). This makes `filter` composable: its output can be piped into
-	// another tool or saved and re-ingested.
 	w := stdcsv.NewWriter(os.Stdout)
+	w.Comma = ';'
 	_ = w.Write(icsv.Header)
 
 	var matched, total int
