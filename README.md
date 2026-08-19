@@ -18,19 +18,26 @@ Go version is pinned via [mise](https://mise.jdx.dev) in
 [.mise.toml](.mise.toml).
 
 ```bash
-mise install                 # installs the pinned Go version
+mise install                 # installs the pinned Go version (and air, for hot reload)
 mise run build-cli           # builds bin/telemetryingestor
 mise run build-processor     # builds bin/telemetryprocessor
 mise run run-processor       # runs the microservice on :8080
+mise run dev-processor       # runs the microservice with hot reload (air), see .air.toml
 mise run test                # go test across both modules
 ```
 
 Without mise, the equivalent plain `go` commands work too, e.g.:
 
 ```bash
-go run ./apps/telemetryingestor -file docs/example_data_2.csv
+go run ./apps/telemetryingestor ingest -file docs/example_data_2.csv
 go run ./apps/telemetryprocessor/cmd/server
 ```
+
+## CLI (`telemetryingestor`)
+
+The CLI has `ingest`, `validate`, and `filter` subcommands. Full usage,
+flags, the filter language, configuration precedence, and stated assumptions
+are documented in [apps/telemetryingestor/README.md](apps/telemetryingestor/README.md).
 
 Note: because this is a multi-module `go.work` workspace, `go build ./...` from
 the repo root does not expand across modules — use
