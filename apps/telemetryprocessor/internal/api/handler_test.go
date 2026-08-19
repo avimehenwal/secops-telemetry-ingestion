@@ -20,7 +20,7 @@ func newHandler(enrichURL, analyticsURL string) *IngestHandler {
 			BackoffMax: time.Millisecond, BreakerTrip: 100, BreakerCooldown: time.Second,
 		}),
 		Analytics: analytics.NewClient(analyticsURL, "k", analytics.Options{
-			Timeout: time.Second, BatchSize: 20, RateLimit: 1000, RateWindow: time.Second, MaxRetries: 2,
+			Timeout: time.Second, BatchSize: 20, RateRequests: 1000, RateWindow: time.Second, MaxRetries: 2,
 		}),
 	}
 }

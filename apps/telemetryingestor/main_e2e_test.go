@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 var binPath string
@@ -103,6 +104,13 @@ func newFakeProcessor(t *testing.T, status int) *fakeProcessor {
 		p.batches = append(p.batches, req.Records)
 		p.mu.Unlock()
 		w.WriteHeader(p.status)
+		if p.status >= 200 && p.status < 300 {
+			_ = json.NewEncoder(w).Encode(ingestResult{
+				Received: len(req.Records),
+				Enriched: len(req.Records),
+				Ingested: len(req.Records),
+			})
+		}
 	}))
 	t.Cleanup(p.Close)
 	return p
@@ -414,5 +422,87 @@ func TestHealthURLDerivation(t *testing.T) {
 		if got, err := healthURL(bad); err == nil {
 			t.Errorf("healthURL(%q) = %q, want an error", bad, got)
 		}
+	}
+}
+
+// The default chunk maps 1:1 onto an upstream Analytics request, and the
+// derived timeout must leave room for the rate-limit window each extra
+// request costs. A fixed timeout is what made every default run fail.
+func TestEstimateTimeoutTracksChunkSize(t *testing.T) {
+	tests := []struct {
+		chunk int
+		want  time.Duration
+	}{
+		{1, timeoutSlack},
+		{20, timeoutSlack},
+		{21, upstreamRateWindow + timeoutSlack},
+		{100, 4*upstreamRateWindow + timeoutSlack},
+	}
+	for _, tc := range tests {
+		if got := estimateTimeout(tc.chunk); got != tc.want {
+			t.Errorf("estimateTimeout(%d) = %s, want %s", tc.chunk, got, tc.want)
+		}
+	}
+	if defaultChunkSize != upstreamBatchSize {
+		t.Errorf("defaultChunkSize = %d, want %d so one chunk is one upstream request",
+			defaultChunkSize, upstreamBatchSize)
+	}
+}
+
+// A chunk that times out may still have been ingested. Reporting it as failed
+// would be false, and would invite a retry that duplicates records upstream.
+func TestIngestReportsTimedOutChunkAsUnknown(t *testing.T) {
+	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/health" {
+			_, _ = w.Write([]byte(`{"status":"ok"}`))
+			return
+		}
+		time.Sleep(500 * time.Millisecond)
+	}))
+	defer slow.Close()
+
+	got := run(t, nil, "ingest", "-file", writeCSV(t, sampleCSV),
+		"-endpoint", slow.URL+"/ingest", "-timeout", "100ms")
+
+	if got.code != 1 {
+		t.Fatalf("exit code = %d, want 1\nstdout: %s", got.code, got.stdout)
+	}
+	if !strings.Contains(got.stderr, "outcome unknown") {
+		t.Errorf("timed-out chunk not reported as unknown:\n%s", got.stderr)
+	}
+	if strings.Contains(got.stderr, "failed (") {
+		t.Errorf("a timeout must not be reported as an outright failure:\n%s", got.stderr)
+	}
+	if !strings.Contains(got.stdout, "outcome unknown:") {
+		t.Errorf("summary does not carry the unknown records:\n%s", got.stdout)
+	}
+}
+
+// A 2xx is not proof of ingestion: the processor's body says how many records
+// reached Analytics, and a shortfall must be visible and non-zero-exit.
+func TestIngestReportsProcessorSideDrops(t *testing.T) {
+	proc := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/health" {
+			_, _ = w.Write([]byte(`{"status":"ok"}`))
+			return
+		}
+		var req ingestRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		_ = json.NewEncoder(w).Encode(ingestResult{
+			Received:       len(req.Records),
+			Enriched:       len(req.Records) - 1,
+			Ingested:       len(req.Records) - 1,
+			FailedCategory: 1,
+		})
+	}))
+	defer proc.Close()
+
+	got := run(t, nil, "ingest", "-file", writeCSV(t, sampleCSV), "-endpoint", proc.URL+"/ingest")
+
+	if got.code != 1 {
+		t.Fatalf("exit code = %d, want 1 when records were dropped\nstdout: %s", got.code, got.stdout)
+	}
+	if !strings.Contains(got.stdout, "ingested:") || !strings.Contains(got.stdout, "dropped (category):") {
+		t.Errorf("summary hides the processor-side drop:\n%s", got.stdout)
 	}
 }

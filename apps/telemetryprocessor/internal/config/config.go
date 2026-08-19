@@ -20,11 +20,11 @@ type Config struct {
 	EnrichmentBreakerTrip     int           // consecutive failures before the breaker opens
 	EnrichmentBreakerCooldown time.Duration // how long the breaker stays open
 
-	AnalyticsTimeout    time.Duration // per-attempt HTTP timeout
-	AnalyticsBatchSize  int           // max events per request (upstream max is 20)
-	AnalyticsRateLimit  int           // messages permitted per RateWindow
-	AnalyticsRateWindow time.Duration // the rate-limit window
-	AnalyticsMaxRetries int           // retries on HTTP 429 before giving up
+	AnalyticsTimeout     time.Duration // per-attempt HTTP timeout
+	AnalyticsBatchSize   int           // max events per request (upstream max is 20)
+	AnalyticsRateRequest int           // requests permitted per RateWindow (upstream allows 1)
+	AnalyticsRateWindow  time.Duration // the rate-limit window
+	AnalyticsMaxRetries  int           // retries on HTTP 429 before giving up
 }
 
 func Load() (Config, error) {
@@ -61,7 +61,7 @@ func Load() (Config, error) {
 	if c.AnalyticsBatchSize, err = getenvInt("ANALYTICS_BATCH_SIZE", 20); err != nil {
 		return Config{}, err
 	}
-	if c.AnalyticsRateLimit, err = getenvInt("ANALYTICS_RATE_LIMIT", 20); err != nil {
+	if c.AnalyticsRateRequest, err = getenvInt("ANALYTICS_RATE_REQUESTS", 1); err != nil {
 		return Config{}, err
 	}
 	if c.AnalyticsRateWindow, err = getenvDuration("ANALYTICS_RATE_WINDOW", 10*time.Second); err != nil {
@@ -82,8 +82,8 @@ func (c Config) validate() error {
 		return fmt.Errorf("ENRICHMENT_BREAKER_TRIP must be >= 1, got %d", c.EnrichmentBreakerTrip)
 	case c.AnalyticsBatchSize < 1 || c.AnalyticsBatchSize > 20:
 		return fmt.Errorf("ANALYTICS_BATCH_SIZE must be between 1 and 20, got %d", c.AnalyticsBatchSize)
-	case c.AnalyticsRateLimit < 1:
-		return fmt.Errorf("ANALYTICS_RATE_LIMIT must be >= 1, got %d", c.AnalyticsRateLimit)
+	case c.AnalyticsRateRequest < 1:
+		return fmt.Errorf("ANALYTICS_RATE_REQUESTS must be >= 1, got %d", c.AnalyticsRateRequest)
 	case c.AnalyticsRateWindow <= 0:
 		return fmt.Errorf("ANALYTICS_RATE_WINDOW must be > 0, got %s", c.AnalyticsRateWindow)
 	}

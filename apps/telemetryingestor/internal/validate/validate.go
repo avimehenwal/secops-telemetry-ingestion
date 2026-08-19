@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/avimehenwal/secops-telemetry-ingestion/apps/telemetryingestor/internal/category"
 	"github.com/avimehenwal/secops-telemetry-ingestion/apps/telemetryingestor/internal/csv"
 )
 
@@ -67,6 +68,7 @@ func Run(src io.Reader) (Report, error) {
 	}
 
 	var rep Report
+	seenIDs := make(map[string]int)
 	for {
 		rec, err := rd.Next()
 		if err == io.EOF {
@@ -74,16 +76,35 @@ func Run(src io.Reader) (Report, error) {
 		}
 		var fce *csv.FieldCountError
 		if err != nil {
-			if asFieldCount(err, &fce) {
-				rep.add(Issue{Line: fce.Line, Severity: SeverityError, Message: fce.Error()})
-			} else {
+			if !asFieldCount(err, &fce) {
 				return rep, err
 			}
+			// The reader pads a short row, so the per-column checks below would
+			// report the padding as missing data. The field count is the one
+			// real defect here; report it alone.
+			rep.Rows++
+			rep.add(Issue{Line: fce.Line, Severity: SeverityError, Message: fce.Error()})
+			continue
 		}
 		rep.Rows++
 		checkRecord(&rep, rec)
+		checkDuplicateID(&rep, rec, seenIDs)
 	}
 	return rep, nil
+}
+
+// checkDuplicateID flags a repeated id: the API documents it as a unique
+// identifier, so a repeat means either a broken export or a double ingest.
+func checkDuplicateID(rep *Report, r csv.Record, seen map[string]int) {
+	if r.ID == "" {
+		return
+	}
+	if first, ok := seen[r.ID]; ok {
+		rep.add(Issue{Line: r.Line, Column: csv.ColID, Severity: SeverityWarning,
+			Message: fmt.Sprintf("duplicate id %s (first seen on line %d)", r.ID, first)})
+		return
+	}
+	seen[r.ID] = r.Line
 }
 
 func checkRecord(rep *Report, r csv.Record) {
@@ -105,6 +126,11 @@ func checkRecord(rep *Report, r csv.Record) {
 
 	if r.Category == "" {
 		rep.add(Issue{Line: r.Line, Column: csv.ColCategory, Severity: SeverityWarning, Message: "empty category"})
+	} else if _, ok := category.Normalize(r.Category); !ok {
+		// The processor drops these at the category stage, so surfacing them
+		// here is the difference between "ingested 999" and a silent shortfall.
+		rep.add(Issue{Line: r.Line, Column: csv.ColCategory, Severity: SeverityWarning,
+			Message: fmt.Sprintf("unrecognised category %q; the processor will drop this record", r.Category)})
 	}
 
 	if r.Source == "" || r.Source == "null" {

@@ -17,7 +17,7 @@ go run ./apps/telemetryingestor <command> [flags]
 The CLI is organised into subcommands:
 
 ```bash
-telemetryingestor ingest   -file <path> [-endpoint <url>] [-chunk-size <n>] [-where <expr>] [-dry-run]
+telemetryingestor ingest   -file <path> [-endpoint <url>] [-chunk-size <n>] [-timeout <dur>] [-where <expr>] [-dry-run]
 telemetryingestor validate -file <path> [-quiet]
 telemetryingestor filter   -file <path> -where <expr> [-where <expr> ...]
 telemetryingestor help
@@ -34,7 +34,8 @@ chunks, printing per-chunk progress and an end-of-run summary.
 | ------------- | ------------------------ | ------------------------------ | ------------------------------------------------- |
 | `-file`       | —                        | — (required)                   | Path to the CSV file to ingest.                   |
 | `-endpoint`   | `EYESECURITY_ENDPOINT`   | `http://localhost:8080/ingest` | Processor ingest endpoint.                        |
-| `-chunk-size` | `EYESECURITY_CHUNK_SIZE` | `100`                          | Records to POST per HTTP request.                 |
+| `-chunk-size` | `EYESECURITY_CHUNK_SIZE` | `20`                           | Records to POST per HTTP request. 20 = one upstream Analytics request. |
+| `-timeout`    | `EYESECURITY_TIMEOUT`    | derived from `-chunk-size`     | Per-chunk HTTP timeout. Default allows for the Analytics rate limit. |
 | `-where`      | —                        | none                           | Filter expression (repeatable, ANDed). See below. |
 | `-dry-run`    | —                        | `false`                        | Parse and filter but send nothing.                |
 
@@ -42,9 +43,9 @@ chunks, printing per-chunk progress and an end-of-run summary.
 # ingest everything on the default endpoint
 telemetryingestor ingest -file docs/example_data_2.csv
 
-# only Defender phishing events, 300 records per request
+# only Defender phishing events
 telemetryingestor ingest -file docs/example_data_2.csv \
-  -where source=defender -where category~phis -chunk-size 300
+  -where source=defender -where category~phis
 
 # preview what would be sent, without hitting the network
 telemetryingestor ingest -file docs/example_data_2.csv -where category~phis -dry-run
@@ -55,17 +56,42 @@ Example output:
 ```
 Ingesting docs/example_data_2.csv
   endpoint:   http://localhost:8080/ingest
-  chunk size: 300
+  chunk size: 20
+  timeout:    30s per chunk
   filter:     category~phis
+  processor:  reachable and healthy
 
-  sent 300 records (300 total)
+  chunk 1: sent 20 records, 20 ingested (20 total)
   ...
+  chunk 10: sent 16 records, 16 ingested (196 total)
+
 Summary:
-  rows read:          998
-  filtered out:       802
-  skipped (malformed): 1
-  sent:               196
+  rows read:            998
+  filtered out:         802
+  skipped (malformed):  1
+  sent:                 196
+  ingested:             196
 ```
+
+`sent` is what the processor accepted; `ingested` is what it confirms reached
+the Analytics Service, read from the response body. They differ when records
+are dropped upstream, and the summary breaks the difference down
+(`dropped (category|enrichment|analytics)`). The exit code is non-zero whenever
+they differ.
+
+A chunk whose HTTP request times out is reported as **`outcome unknown`**, not
+as failed: the processor may well have completed the work after the CLI hung
+up, so calling it a failure would be wrong and a blind retry would duplicate
+records upstream. Re-run such chunks deliberately, with a longer `-timeout` or
+smaller `-chunk-size`.
+
+### Throughput
+
+The Analytics Service allows 1 request of ≤ 20 items per 10 s, so the pipeline
+tops out at **20 records / 10 s** — about 8.5 minutes for the 999-row sample
+file. The default `-chunk-size` of 20 maps one chunk onto one upstream request,
+and `-timeout` defaults to `(ceil(chunk/20) - 1) × 10s + 30s` so a chunk is
+never cancelled merely for waiting its turn.
 
 ### `validate`
 
@@ -147,3 +173,8 @@ id;asset_name;ip;created_utc;source;category
   counted** in the feedback rather than aborting the whole run.
 - `chunk-size` controls only the CLI→processor request size; the downstream
   20-item Analytics batching and rate limiting are the processor's concern.
+  The default is aligned to 20 so the two agree, but any positive size works.
+- Records are **not** idempotent end to end: the CLI never retries a chunk on
+  its own, because re-sending would duplicate anything the processor had
+  already forwarded. De-duplicating on `id` upstream is the prerequisite for
+  automatic retries.

@@ -51,3 +51,61 @@ func TestRunOnCleanData(t *testing.T) {
 		t.Fatalf("expected clean report, got %+v", rep)
 	}
 }
+
+func TestRunReportsShortRowOnceWithoutPhantomWarnings(t *testing.T) {
+	const data = `id;asset_name;ip;created_utc;source;category
+889807;server_summit;131.21.57.124;02/09/2024 00:00;pxtrpf
+`
+	rep, err := Run(strings.NewReader(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.Rows != 1 {
+		t.Fatalf("Rows=%d, want 1", rep.Rows)
+	}
+	if len(rep.Issues) != 1 {
+		t.Fatalf("want exactly one issue for a short row, got %v", rep.Issues)
+	}
+	if rep.Errors != 1 || rep.Warnings != 0 {
+		t.Fatalf("Errors=%d Warnings=%d, want 1/0 (%v)", rep.Errors, rep.Warnings, rep.Issues)
+	}
+	if !strings.Contains(rep.Issues[0].Message, "expected 6 fields") {
+		t.Fatalf("unexpected issue: %v", rep.Issues[0])
+	}
+}
+
+func TestRunFlagsDuplicateIDs(t *testing.T) {
+	const data = `id;asset_name;ip;created_utc;source;category
+1;a;1.2.3.4;27/02/2024 00:00;edr;phising
+1;b;1.2.3.5;27/02/2024 00:00;edr;phising
+`
+	rep, err := Run(strings.NewReader(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.Warnings != 1 || !strings.Contains(rep.Issues[0].Message, "duplicate id 1") {
+		t.Fatalf("expected one duplicate-id warning, got %v", rep.Issues)
+	}
+	if rep.Issues[0].Line != 3 {
+		t.Fatalf("duplicate reported on line %d, want 3", rep.Issues[0].Line)
+	}
+}
+
+func TestRunWarnsOnlyOnUnmappableCategories(t *testing.T) {
+	const data = `id;asset_name;ip;created_utc;source;category
+1;a;1.2.3.4;27/02/2024 00:00;edr;phising
+2;b;1.2.3.5;27/02/2024 00:00;edr;compromise (driveby)
+3;c;1.2.3.6;27/02/2024 00:00;edr;valida_accounts
+4;d;1.2.3.7;27/02/2024 00:00;edr;cryptomining
+`
+	rep, err := Run(strings.NewReader(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.Warnings != 1 {
+		t.Fatalf("Warnings=%d, want 1 (%v)", rep.Warnings, rep.Issues)
+	}
+	if rep.Issues[0].Line != 5 || !strings.Contains(rep.Issues[0].Message, "cryptomining") {
+		t.Fatalf("wrong row flagged: %v", rep.Issues[0])
+	}
+}

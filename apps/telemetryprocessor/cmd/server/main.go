@@ -35,11 +35,11 @@ func main() {
 			BreakerCooldown: cfg.EnrichmentBreakerCooldown,
 		}),
 		Analytics: analytics.NewClient(cfg.AnalyticsURL, cfg.APIKey, analytics.Options{
-			Timeout:    cfg.AnalyticsTimeout,
-			BatchSize:  cfg.AnalyticsBatchSize,
-			RateLimit:  cfg.AnalyticsRateLimit,
-			RateWindow: cfg.AnalyticsRateWindow,
-			MaxRetries: cfg.AnalyticsMaxRetries,
+			Timeout:      cfg.AnalyticsTimeout,
+			BatchSize:    cfg.AnalyticsBatchSize,
+			RateRequests: cfg.AnalyticsRateRequest,
+			RateWindow:   cfg.AnalyticsRateWindow,
+			MaxRetries:   cfg.AnalyticsMaxRetries,
 		}),
 		Logger: logger,
 	}
@@ -67,8 +67,8 @@ func main() {
 	defer stop()
 
 	go func() {
-		logger.Printf("telemetryprocessor listening on %s (enrichment=%s analytics=%s, rate=%d/%s)",
-			cfg.Addr, cfg.EnrichmentURL, cfg.AnalyticsURL, cfg.AnalyticsRateLimit, cfg.AnalyticsRateWindow)
+		logger.Printf("telemetryprocessor listening on %s (enrichment=%s analytics=%s, rate=%d req/%s, batch=%d)",
+			cfg.Addr, cfg.EnrichmentURL, cfg.AnalyticsURL, cfg.AnalyticsRateRequest, cfg.AnalyticsRateWindow, cfg.AnalyticsBatchSize)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			logger.Fatalf("server error: %v", err)
 		}

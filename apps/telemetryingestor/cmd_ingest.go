@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"os"
 	"strconv"
-	"time"
 
 	icsv "github.com/avimehenwal/secops-telemetry-ingestion/apps/telemetryingestor/internal/csv"
 	"github.com/avimehenwal/secops-telemetry-ingestion/apps/telemetryingestor/internal/filter"
@@ -26,17 +25,34 @@ type ingestRequest struct {
 	Records []ingestRecord `json:"records"`
 }
 
+// ingestResult mirrors the processor's response body. A 2xx only means the
+// chunk was accepted; the body says how many records actually reached the
+// Analytics Service, so the CLI reports that rather than assuming success.
+type ingestResult struct {
+	Received         int `json:"received"`
+	Enriched         int `json:"enriched"`
+	Ingested         int `json:"ingested"`
+	FailedEnrichment int `json:"failedEnrichment"`
+	FailedCategory   int `json:"failedCategory"`
+	FailedAnalytics  int `json:"failedAnalytics"`
+
+	// accounted is false when the processor accepted the chunk but returned a
+	// body we could not read, so its per-record outcome is unknown.
+	accounted bool
+}
+
 func runIngest(args []string) int {
 	fs := flag.NewFlagSet("ingest", flag.ContinueOnError)
 	file := fs.String("file", "", "path to the CSV file to ingest (required)")
 	endpoint := fs.String("endpoint", defaultEndpoint, "processor ingest endpoint (env "+envEndpoint+")")
 	chunkSize := fs.Int("chunk-size", defaultChunkSize, "records to POST per request (env "+envChunkSize+")")
+	timeout := fs.Duration("timeout", 0, "per-chunk HTTP timeout; default is derived from -chunk-size (env "+envTimeout+")")
 	dryRun := fs.Bool("dry-run", false, "parse and filter but do not POST anything")
 	skipPreflight := fs.Bool("skip-preflight", false, "do not health-check the processor before ingesting")
 	var where stringSlice
 	fs.Var(&where, "where", "filter as column=value (exact) or column~value (contains); repeatable, ANDed")
 	fs.Usage = func() {
-		fmt.Fprintf(fs.Output(), "Ingest a telemetry CSV and POST records to the processor.\n\nUsage:\n  telemetryingestor ingest -file <path> [-endpoint <url>] [-chunk-size <n>] [-where <expr>] [-dry-run] [-skip-preflight]\n\nFlags:\n")
+		fmt.Fprintf(fs.Output(), "Ingest a telemetry CSV and POST records to the processor.\n\nUsage:\n  telemetryingestor ingest -file <path> [-endpoint <url>] [-chunk-size <n>] [-timeout <dur>] [-where <expr>] [-dry-run] [-skip-preflight]\n\nFlags:\n")
 		fs.PrintDefaults()
 	}
 	if err := fs.Parse(args); err != nil {
@@ -56,13 +72,19 @@ func runIngest(args []string) int {
 		return 2
 	}
 
+	resolvedTimeout, err := resolveTimeout(*timeout, flagWasSet(fs, "timeout"), resolvedChunk)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		return 2
+	}
+
 	flt, err := filter.Parse(where)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		return 2
 	}
 
-	send, verb := chunkSender(*dryRun, &http.Client{Timeout: 30 * time.Second}, resolvedEndpoint)
+	send, verb := chunkSender(*dryRun, &http.Client{Timeout: resolvedTimeout}, resolvedEndpoint)
 
 	if !*dryRun && !*skipPreflight {
 		probe := &http.Client{Timeout: defaultPreflightTimeout}
@@ -88,6 +110,12 @@ func runIngest(args []string) int {
 	fmt.Printf("Ingesting %s\n", *file)
 	fmt.Printf("  endpoint:   %s\n", resolvedEndpoint)
 	fmt.Printf("  chunk size: %d\n", resolvedChunk)
+	if !*dryRun {
+		fmt.Printf("  timeout:    %s per chunk\n", resolvedTimeout)
+	}
+	if resolvedChunk > upstreamBatchSize {
+		fmt.Printf("  note:       chunks above %d span several rate-limited upstream requests\n", upstreamBatchSize)
+	}
 	if !flt.Empty() {
 		fmt.Printf("  filter:     %s\n", where.String())
 	}
@@ -109,13 +137,32 @@ func runIngest(args []string) int {
 			return
 		}
 		chunkNum++
-		if err := send(batch); err != nil {
+		res, err := send(batch)
+		switch {
+		case err == nil && !res.accounted:
+			stats.accepted += len(batch)
+			stats.unaccounted += len(batch)
+			fmt.Printf("  chunk %d: %s %d records (processor returned no per-record counts)\n",
+				chunkNum, verb, len(batch))
+		case err == nil:
+			stats.accepted += len(batch)
+			stats.ingested += res.Ingested
+			stats.droppedCategory += res.FailedCategory
+			stats.droppedEnrichment += res.FailedEnrichment
+			stats.droppedAnalytics += res.FailedAnalytics
+			fmt.Printf("  chunk %d: %s %d records, %d ingested (%d total)\n",
+				chunkNum, verb, len(batch), res.Ingested, stats.ingested)
+		case isTimeout(err):
+			// The processor may well have finished the work after we hung up:
+			// calling this "failed" would be a lie, and a blind retry would
+			// duplicate records upstream.
+			stats.unknownChunks++
+			stats.unknownRecords += len(batch)
+			fmt.Fprintf(os.Stderr, "  chunk %d timed out (%d records, outcome unknown): %v\n", chunkNum, len(batch), err)
+		default:
 			stats.failedChunks++
 			stats.failedRecords += len(batch)
 			fmt.Fprintf(os.Stderr, "  chunk %d failed (%d records): %v\n", chunkNum, len(batch), err)
-		} else {
-			stats.sent += len(batch)
-			fmt.Printf("  chunk %d: %s %d records (%d total)\n", chunkNum, verb, len(batch), stats.sent)
 		}
 		batch = batch[:0]
 	}
@@ -158,11 +205,13 @@ func runIngest(args []string) int {
 	return stats.report(verb)
 }
 
-func chunkSender(dryRun bool, client *http.Client, endpoint string) (send func([]ingestRecord) error, verb string) {
+func chunkSender(dryRun bool, client *http.Client, endpoint string) (send func([]ingestRecord) (ingestResult, error), verb string) {
 	if dryRun {
-		return func([]ingestRecord) error { return nil }, "would send"
+		return func(batch []ingestRecord) (ingestResult, error) {
+			return ingestResult{Received: len(batch), Ingested: len(batch), accounted: true}, nil
+		}, "would send"
 	}
-	return func(batch []ingestRecord) error {
+	return func(batch []ingestRecord) (ingestResult, error) {
 		return postChunk(client, endpoint, batch)
 	}, "sent"
 }
@@ -180,41 +229,55 @@ func toIngestRecord(r icsv.Record) (ingestRecord, bool) {
 	}, true
 }
 
-func postChunk(client *http.Client, endpoint string, records []ingestRecord) error {
+func postChunk(client *http.Client, endpoint string, records []ingestRecord) (ingestResult, error) {
 	body, err := json.Marshal(ingestRequest{Records: records})
 	if err != nil {
-		return fmt.Errorf("marshalling request: %w", err)
+		return ingestResult{}, fmt.Errorf("marshalling request: %w", err)
 	}
 	req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
-		return fmt.Errorf("building request: %w", err)
+		return ingestResult{}, fmt.Errorf("building request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return err
+		return ingestResult{}, err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
-		return fmt.Errorf("processor returned %s: %s", resp.Status, bytes.TrimSpace(snippet))
+		return ingestResult{}, fmt.Errorf("processor returned %s: %s", resp.Status, bytes.TrimSpace(snippet))
 	}
-	return nil
+
+	var res ingestResult
+	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+		// Accepted, but we cannot say what happened to the individual records.
+		return ingestResult{Received: len(records)}, nil
+	}
+	res.accounted = true
+	return res, nil
 }
 
 type ingestStats struct {
-	read             int
-	filteredOut      int
-	skippedMalformed int
-	skippedInvalid   int
-	sent             int
-	failedRecords    int
-	failedChunks     int
+	read              int
+	filteredOut       int
+	skippedMalformed  int
+	skippedInvalid    int
+	accepted          int
+	ingested          int
+	unaccounted       int
+	droppedCategory   int
+	droppedEnrichment int
+	droppedAnalytics  int
+	failedRecords     int
+	failedChunks      int
+	unknownRecords    int
+	unknownChunks     int
 }
 
-const statLabelWidth = 21
+const statLabelWidth = 22
 
 func printStat(label string, value int) {
 	fmt.Printf("  %-*s%d\n", statLabelWidth, label, value)
@@ -232,10 +295,36 @@ func (s ingestStats) report(verb string) int {
 	if s.skippedInvalid > 0 {
 		printStat("skipped (bad id):", s.skippedInvalid)
 	}
-	printStat(verb+":", s.sent)
+	printStat(verb+":", s.accepted)
+	if s.unaccounted < s.accepted {
+		printStat("ingested:", s.ingested)
+	}
+	if s.unaccounted > 0 {
+		printStat("unconfirmed:", s.unaccounted)
+	}
+	if s.droppedCategory > 0 {
+		printStat("dropped (category):", s.droppedCategory)
+	}
+	if s.droppedEnrichment > 0 {
+		printStat("dropped (enrichment):", s.droppedEnrichment)
+	}
+	if s.droppedAnalytics > 0 {
+		printStat("dropped (analytics):", s.droppedAnalytics)
+	}
+
+	exit := 0
 	if s.failedRecords > 0 {
 		fmt.Printf("  %-*s%d records in %d chunk(s)\n", statLabelWidth, "failed:", s.failedRecords, s.failedChunks)
-		return 1
+		exit = 1
 	}
-	return 0
+	if s.unknownRecords > 0 {
+		fmt.Printf("  %-*s%d records in %d chunk(s)\n", statLabelWidth, "outcome unknown:", s.unknownRecords, s.unknownChunks)
+		fmt.Println("\nChunks that timed out may still have been ingested. Re-run with a longer\n" +
+			"-timeout, or a smaller -chunk-size, and expect duplicates for those records.")
+		exit = 1
+	}
+	if s.ingested < s.accepted-s.unaccounted && exit == 0 {
+		exit = 1
+	}
+	return exit
 }

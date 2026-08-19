@@ -81,11 +81,13 @@ For each record:
   with exponential backoff (network errors, 429, 5xx) and fronted by a
   **circuit breaker** that fails fast once the service is clearly down. A `400`
   is treated as a permanent per-record error and is not retried.
-- **Analytics** is rate limited (20 messages / 10 s) and accepts at most 20
-  items per request. The client batches to ≤ 20 and gates every event through a
+- **Analytics** is rate limited to **1 request / 10 s** and accepts at most 20
+  items per request (see `/analytics` in `docs/openapi.json`). The client
+  batches to ≤ 20 and gates every *request* — including 429 retries — through a
   **shared token-bucket limiter**, so the process stays within quota *even
-  across concurrent ingest requests*. `429` responses are retried, honouring
-  `Retry-After`.
+  across concurrent ingest requests*. Note the limit counts requests, not
+  items: a short trailing batch still costs a whole window. `429` responses are
+  retried, honouring `Retry-After`.
 
 ## Configuration
 
@@ -106,7 +108,7 @@ process fails fast at startup on a malformed value.
 | `ENRICHMENT_BREAKER_COOLDOWN` | `15s`                                  | How long the breaker stays open.                   |
 | `ANALYTICS_TIMEOUT`           | `10s`                                  | Per-attempt HTTP timeout.                          |
 | `ANALYTICS_BATCH_SIZE`        | `20`                                   | Max events per request (1–20).                     |
-| `ANALYTICS_RATE_LIMIT`        | `20`                                   | Messages permitted per window.                     |
+| `ANALYTICS_RATE_REQUESTS`     | `1`                                    | Requests permitted per window (upstream allows 1). |
 | `ANALYTICS_RATE_WINDOW`       | `10s`                                  | The rate-limit window.                             |
 | `ANALYTICS_MAX_RETRIES`       | `5`                                    | Retries on HTTP 429.                               |
 
@@ -117,7 +119,7 @@ mise run dev-processor          # hot reload via air
 # example: point at a local mock and loosen the rate limit for testing
 ENRICHMENT_URL=http://localhost:8091/enrichment \
 ANALYTICS_URL=http://localhost:8091/analytics \
-ANALYTICS_RATE_LIMIT=50 ANALYTICS_RATE_WINDOW=1s \
+ANALYTICS_RATE_REQUESTS=50 ANALYTICS_RATE_WINDOW=1s \
   go run ./apps/telemetryprocessor/cmd/server
 ```
 
@@ -126,10 +128,18 @@ ingests (which can be slow under the Analytics rate limit) for up to 30 s.
 
 ## Throughput note (rate limit ↔ CLI)
 
-The Analytics limit (20 messages / 10 s) is the pipeline's bottleneck: a single
-`/ingest` call carrying *N* records blocks for roughly `N/20 × 10s` while the
-limiter drains. Because the limiter is **shared**, splitting a large file into
-many small CLI requests does **not** exceed the global quota — so for big
-ingests prefer a small `-chunk-size` (e.g. `20`) on the CLI, which keeps each
-HTTP request short and within the CLI's client timeout while overall throughput
-stays capped at the mandated rate.
+The Analytics limit (1 request / 10 s, ≤ 20 items each) is the pipeline's hard
+bottleneck: **20 records per 10 s, ~8.5 minutes for a 1000-row file**, and no
+amount of client-side concurrency changes that. A single `/ingest` call
+carrying *N* records blocks for roughly `(ceil(N/20) - 1) × 10s`.
+
+Because the limiter is **shared**, splitting a file into many small CLI
+requests does **not** exceed the global quota. The CLI therefore defaults
+`-chunk-size` to **20** — one chunk is exactly one upstream request — and
+derives its HTTP timeout from that, so a chunk can never be cancelled just for
+obeying the rate limit. Larger chunks work but hold one HTTP request open
+across several windows, putting more records at risk if the connection drops.
+
+The honest next step for production is to stop modelling this as a synchronous
+call: have `/ingest` return `202` with a job id and drain the queue in the
+background, so an 8-minute file is not one hanging request.

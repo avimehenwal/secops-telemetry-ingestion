@@ -25,11 +25,11 @@ func events(n int) []model.AnalyticsEvent {
 // without slowing the test.
 func fastOpts() Options {
 	return Options{
-		Timeout:    2 * time.Second,
-		BatchSize:  20,
-		RateLimit:  1000,
-		RateWindow: time.Second,
-		MaxRetries: 3,
+		Timeout:      2 * time.Second,
+		BatchSize:    20,
+		RateRequests: 1000,
+		RateWindow:   time.Second,
+		MaxRetries:   3,
 	}
 }
 
@@ -103,10 +103,10 @@ func TestSendRateLimitThrottles(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	// 20 messages / 200ms. Sending 40 events (2 full batches) must take at
-	// least one refill window because the initial bucket only covers 20.
+	// The upstream limit is 1 *request* per window (see openapi.json), so two
+	// batches must straddle at least one full window.
 	opts := fastOpts()
-	opts.RateLimit = 20
+	opts.RateRequests = 1
 	opts.RateWindow = 200 * time.Millisecond
 	c := NewClient(srv.URL, "k", opts)
 
@@ -121,5 +121,32 @@ func TestSendRateLimitThrottles(t *testing.T) {
 	}
 	if elapsed < 180*time.Millisecond {
 		t.Fatalf("expected rate limiting to add ~200ms, only took %v", elapsed)
+	}
+}
+
+// The upstream limit counts requests, not items: a short trailing batch must
+// still consume a whole window, otherwise the processor out-paces the limit
+// and earns 429s.
+func TestSendRateLimitsShortBatchesPerRequest(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var batch []model.AnalyticsEvent
+		_ = json.NewDecoder(r.Body).Decode(&batch)
+		_ = json.NewEncoder(w).Encode(model.AnalyticsSuccessResponse{Status: "ok", ItemsIngested: int64(len(batch))})
+	}))
+	defer srv.Close()
+
+	opts := fastOpts()
+	opts.RateRequests = 1
+	opts.RateWindow = 200 * time.Millisecond
+	opts.BatchSize = 2
+	c := NewClient(srv.URL, "k", opts)
+
+	// 3 events at batch size 2 => 2 requests, the second one short.
+	start := time.Now()
+	if _, err := c.Send(context.Background(), events(3)); err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(start); elapsed < 180*time.Millisecond {
+		t.Fatalf("short batch skipped the rate limiter: 2 requests took only %v", elapsed)
 	}
 }

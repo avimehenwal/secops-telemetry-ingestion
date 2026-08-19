@@ -17,11 +17,11 @@ import (
 const UpstreamMaxBatchSize = 20
 
 type Options struct {
-	Timeout    time.Duration // per-attempt HTTP timeout
-	BatchSize  int           // max events per request (clamped to UpstreamMaxBatchSize)
-	RateLimit  int           // messages permitted per RateWindow
-	RateWindow time.Duration // the rate-limit window
-	MaxRetries int           // retries on HTTP 429
+	Timeout      time.Duration // per-attempt HTTP timeout
+	BatchSize    int           // max events per request (clamped to UpstreamMaxBatchSize)
+	RateRequests int           // requests permitted per RateWindow (upstream allows 1)
+	RateWindow   time.Duration // the rate-limit window
+	MaxRetries   int           // retries on HTTP 429
 }
 
 type Client struct {
@@ -44,7 +44,7 @@ func NewClient(baseURL, apiKey string, opts Options) *Client {
 		http:      &http.Client{Timeout: opts.Timeout},
 		batchSize: batch,
 		maxRetry:  opts.MaxRetries,
-		limiter:   ratelimit.New(opts.RateLimit, opts.RateWindow),
+		limiter:   ratelimit.New(opts.RateRequests, opts.RateWindow),
 	}
 }
 
@@ -56,10 +56,6 @@ func (c *Client) Send(ctx context.Context, events []model.AnalyticsEvent) (int, 
 			end = len(events)
 		}
 		batch := events[start:end]
-
-		if err := c.limiter.Wait(ctx, len(batch)); err != nil {
-			return ingested, err
-		}
 
 		n, err := c.sendBatch(ctx, batch)
 		ingested += n
@@ -79,6 +75,12 @@ func (c *Client) sendBatch(ctx context.Context, batch []model.AnalyticsEvent) (i
 	var lastErr error
 	for attempt := 0; attempt <= c.maxRetry; attempt++ {
 		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
+
+		// The upstream limit is expressed per request, not per item, so every
+		// attempt -- including a retry after a 429 -- costs exactly one token.
+		if err := c.limiter.Wait(ctx, 1); err != nil {
 			return 0, err
 		}
 
