@@ -1,0 +1,18 @@
+[tools]
+go = "1.26.6"
+
+[tasks.build-cli]
+description = "Build the telemetryIngestor CLI"
+run = "go build -o bin/telemetryingestor ./apps/telemetryingestor"
+
+[tasks.build-processor]
+description = "Build the telemetry processor microservice"
+run = "go build -o bin/telemetryprocessor ./apps/telemetryprocessor/cmd/server"
+
+[tasks.run-processor]
+description = "Run the telemetry processor microservice"
+run = "go run ./apps/telemetryprocessor/cmd/server"
+
+[tasks.test]
+description = "Run all tests in the workspace"
+run = "go test ./apps/telemetryingestor/... ./apps/telemetryprocessor/..."

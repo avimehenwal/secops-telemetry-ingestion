@@ -1,0 +1,317 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "version": "1.0",
+    "title": "Heyering API 1.0",
+    "description": "This OpenAPI file contains the specification of the Heyering API for use in the tech assessment. The API is available on \"https://api.heyering.com/<endpoint>\"."
+  },
+  "externalDocs": {
+    "description": "Find out more about jobs at Eye Security",
+    "url": "http://jobs.eye.security/"
+  },
+  "servers": [
+    {
+      "url": "https://api.heyering.com/"
+    }
+  ],
+  "security": [
+    {
+      "APIKeyHeader": []
+    }
+  ],
+  "paths": {
+    "/enrichment": {
+      "post": {
+        "summary": "Enrichtment service",
+        "description": "Request additional information to enrich security log events. Accepted input values for categories are listed in the schema on this page.",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "Authorization",
+            "description": "API key provided to you by Eye Security",
+            "schema": {
+              "type": "string"
+            },
+            "required": true
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Logline"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful operation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EnrichmentDetailsResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid input"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        }
+      }
+    },
+    "/analytics": {
+      "post": {
+        "summary": "Analytics service",
+        "description": "Store security events in the analytics platform. Please note the rate limit of 1 request per 10 seconds and the maximum number of 20 items per request.",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "Authorization",
+            "description": "API key provided to you by Eye Security",
+            "schema": {
+              "type": "string"
+            },
+            "required": true
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AnalyticsRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful operation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AnalyticsSuccessResponse",
+                  "type": "object",
+                  "properties": {
+                    "status": {
+                      "type": "string",
+                      "enum": [
+                        "ok",
+                        "error"
+                      ]
+                    },
+                    "itemsIngested": {
+                      "type": "integer",
+                      "format": "int64",
+                      "description": "The number of items the service has ingested successfully",
+                      "examples": [
+                        0,
+                        10,
+                        20
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid input"
+          },
+          "429": {
+            "description": "Rate limit, remain your calm"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "APIKeyHeader": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "Authorization"
+      }
+    },
+    "schemas": {
+      "Logline": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer",
+            "description": "numeric unique identifier of the log line",
+            "format": "int64",
+            "examples": [
+              23493,
+              1238503
+            ],
+            "optional": true
+          },
+          "asset": {
+            "type": "string",
+            "description": "Name of the involved asset (e.g. computer, server, laptop)",
+            "examples": [
+              "DC01",
+              "NB0483D",
+              "FAIRY_DUST"
+            ]
+          },
+          "ip": {
+            "type": "string",
+            "description": "IP address of the involved asset",
+            "examples": [
+              "192.168.0.1",
+              "127.0.0.1",
+              "10.0.0.1"
+            ]
+          },
+          "category": {
+            "type": "string",
+            "description": "MITE category name belonging to the log line event",
+            "enum": [
+              "contentinjection",
+              "drivebycompromise",
+              "exploitpublicfacingapplication",
+              "externalremoteservices",
+              "hardwareadditions",
+              "phishing",
+              "replicationthroughremovablemedia",
+              "supplychaincompromise",
+              "trustedrelationship",
+              "validaccounts"
+            ]
+          }
+        }
+      },
+      "EnrichmentDetailsResponse": {
+        "type": "object",
+        "properties": {
+          "asn": {
+            "type": "string",
+            "description": "Autonomous System Number (ASN) describing the network the traffic is routed through",
+            "examples": [
+              "ASN1337"
+            ]
+          },
+          "category": {
+            "type": "string",
+            "description": "MITRE ATTACK category handle",
+            "examples": [
+              "T1659",
+              "T1189"
+            ]
+          },
+          "correlationId": {
+            "type": "integer",
+            "description": "Internal correlation reference",
+            "examples": [
+              23578,
+              34258
+            ]
+          }
+        }
+      },
+      "AnalyticsEvent": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer",
+            "description": "numeric unique identifier of the log line",
+            "format": "int64",
+            "examples": [
+              1,
+              10,
+              100
+            ],
+            "optional": true
+          },
+          "asset": {
+            "type": "string",
+            "description": "Name of the involved asset (e.g. computer, server, laptop)",
+            "examples": [
+              "DC01",
+              "NB0483D",
+              "FAIRY_DUST"
+            ]
+          },
+          "ip": {
+            "type": "string",
+            "description": "IP address of the involved asset",
+            "examples": [
+              "192.168.0.1",
+              "127.0.0.1",
+              "10.0.0.1"
+            ]
+          },
+          "category": {
+            "type": "string",
+            "description": "MITRE ATTACK category handle",
+            "enum": [
+              "T1659",
+              "T1189",
+              "T1190",
+              "T1133",
+              "T1200",
+              "T1566",
+              "T1091",
+              "T1195",
+              "T1199",
+              "T1078"
+            ]
+          },
+          "asn": {
+            "type": "string",
+            "description": "Autonomous System Number (ASN) describing the network the traffic is routed through",
+            "examples": [
+              "ASN1337"
+            ]
+          },
+          "correlationId": {
+            "type": "integer",
+            "description": "Internal correlation reference",
+            "examples": [
+              23578,
+              34258
+            ]
+          }
+        }
+      },
+      "AnalyticsRequest": {
+        "type": "array",
+        "items": {
+          "$ref": "#/components/schemas/AnalyticsEvent"
+        }
+      },
+      "AnalyticsSuccessResponse": {
+        "type": "object",
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "ok",
+              "error"
+            ]
+          },
+          "itemsIngested": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The number of items the service has ingested successfully",
+            "examples": [
+              10,
+              20
+            ]
+          }
+        }
+      }
+    }
+  }
+}

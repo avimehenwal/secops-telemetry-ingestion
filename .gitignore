@@ -20,8 +20,7 @@ profile.cov
 # Dependency directories (remove the comment below to include it)
 # vendor/
 
-# Go workspace file
-go.work
+# go.work is committed deliberately: it defines this monorepo's workspace.
 go.work.sum
 
 # env file
@@ -30,3 +29,8 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+
+# Build output
+/bin/
+*.log
+.DS_Store
