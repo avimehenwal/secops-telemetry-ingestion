@@ -17,7 +17,7 @@ go run ./apps/telemetryingestor <command> [flags]
 The CLI is organised into subcommands:
 
 ```bash
-telemetryingestor ingest   -file <path> [-endpoint <url>] [-chunk-size <n>] [-timeout <dur>] [-where <expr>] [-dry-run]
+telemetryingestor ingest   -file <path> [-endpoint <url>] [-timeout <dur>] [-where <expr>] [-dry-run]
 telemetryingestor validate -file <path> [-quiet]
 telemetryingestor filter   -file <path> -where <expr> [-where <expr> ...]
 telemetryingestor help
@@ -27,15 +27,19 @@ Run `telemetryingestor <command> -h` for command-specific flags.
 
 ### `ingest`
 
-Streams the CSV, applies any filters, and POSTs the records to the processor in
-chunks, printing per-chunk progress and an end-of-run summary.
+Reads the CSV, applies any filters, and POSTs the records to the processor as a
+single request, then prints an end-of-run summary.
+
+The CLI does **not** chunk. Splitting the file up would only move batching to
+the wrong place: the processor already coalesces records from every client into
+full 20-item upstream batches, and a client-side split just makes those batches
+worse. See [Throughput](#throughput).
 
 | Flag          | Env var                  | Default                        | Description                                       |
 | ------------- | ------------------------ | ------------------------------ | ------------------------------------------------- |
 | `-file`       | —                        | — (required)                   | Path to the CSV file to ingest.                   |
 | `-endpoint`   | `EYESECURITY_ENDPOINT`   | `http://localhost:8080/ingest` | Processor ingest endpoint.                        |
-| `-chunk-size` | `EYESECURITY_CHUNK_SIZE` | `20`                           | Records to POST per HTTP request. 20 = one upstream Analytics request. |
-| `-timeout`    | `EYESECURITY_TIMEOUT`    | derived from `-chunk-size`     | Per-chunk HTTP timeout. Default allows for the Analytics rate limit. |
+| `-timeout`    | `EYESECURITY_TIMEOUT`    | derived from the record count  | HTTP timeout. The default allows for the Analytics rate limit. |
 | `-where`      | —                        | none                           | Filter expression (repeatable, ANDed). See below. |
 | `-dry-run`    | —                        | `false`                        | Parse and filter but send nothing.                |
 
@@ -56,14 +60,14 @@ Example output:
 ```
 Ingesting docs/example_data_2.csv
   endpoint:   http://localhost:8080/ingest
-  chunk size: 20
-  timeout:    30s per chunk
   filter:     category~phis
   processor:  reachable and healthy
+  records:    196
+  estimated:  1m30s at 20 records / 10s (upstream rate limit)
+  timeout:    2m0s
 
-  chunk 1: sent 20 records, 20 ingested (20 total)
-  ...
-  chunk 10: sent 16 records, 16 ingested (196 total)
+  sending...
+  done
 
 Summary:
   rows read:            998
@@ -79,19 +83,22 @@ are dropped upstream, and the summary breaks the difference down
 (`dropped (category|enrichment|analytics)`). The exit code is non-zero whenever
 they differ.
 
-A chunk whose HTTP request times out is reported as **`outcome unknown`**, not
-as failed: the processor may well have completed the work after the CLI hung
-up, so calling it a failure would be wrong and a blind retry would duplicate
-records upstream. Re-run such chunks deliberately, with a longer `-timeout` or
-smaller `-chunk-size`.
+A request that times out is reported as **`outcome unknown`**, not as failed:
+the processor may well have completed the work after the CLI hung up, so
+calling it a failure would be wrong and a blind retry would duplicate records
+upstream. Re-run deliberately, with a longer `-timeout`.
 
 ### Throughput
 
 The Analytics Service allows 1 request of ≤ 20 items per 10 s, so the pipeline
 tops out at **20 records / 10 s** — about 8.5 minutes for the 999-row sample
-file. The default `-chunk-size` of 20 maps one chunk onto one upstream request,
-and `-timeout` defaults to `(ceil(chunk/20) - 1) × 10s + 30s` so a chunk is
-never cancelled merely for waiting its turn.
+file. Nothing client-side changes that number, which is why the CLI does not
+try: it sends everything in one request and lets the processor's shared batcher
+keep every upstream batch full.
+
+`-timeout` therefore defaults to `(ceil(records/20) - 1) × 10s + 30s`, so a run
+is never cancelled merely for waiting its turn. The CLI prints the estimate
+before it starts.
 
 ### `validate`
 
@@ -171,10 +178,13 @@ id;asset_name;ip;created_utc;source;category
   contract and are dropped when sending.
 - Malformed rows (wrong field count, non-integer `id`) are **skipped and
   counted** in the feedback rather than aborting the whole run.
-- `chunk-size` controls only the CLI→processor request size; the downstream
-  20-item Analytics batching and rate limiting are the processor's concern.
-  The default is aligned to 20 so the two agree, but any positive size works.
-- Records are **not** idempotent end to end: the CLI never retries a chunk on
-  its own, because re-sending would duplicate anything the processor had
-  already forwarded. De-duplicating on `id` upstream is the prerequisite for
-  automatic retries.
+- Batching and rate limiting are entirely the processor's concern; the CLI has
+  no knowledge of the 20-item upstream limit beyond estimating how long a run
+  will take.
+- The whole filtered file is held in memory before sending. At ~60 bytes per
+  record that is negligible next to the hours the rate limit would need for a
+  file large enough to matter.
+- Records are **not** idempotent end to end: the CLI never retries on its own,
+  because re-sending would duplicate anything the processor had already
+  forwarded. De-duplicating on `id` upstream is the prerequisite for automatic
+  retries.

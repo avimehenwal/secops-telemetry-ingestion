@@ -22,6 +22,9 @@ type Config struct {
 
 	AnalyticsTimeout     time.Duration // per-attempt HTTP timeout
 	AnalyticsBatchSize   int           // max events per request (upstream max is 20)
+	AnalyticsBatchDelay  time.Duration // how long a partial batch waits for company
+	AnalyticsQueueSize   int           // events buffered before ingest requests block
+	AnalyticsBatchGrace  time.Duration // budget for delivering queued events at shutdown
 	AnalyticsRateRequest int           // requests permitted per RateWindow (upstream allows 1)
 	AnalyticsRateWindow  time.Duration // the rate-limit window
 	AnalyticsMaxRetries  int           // retries on HTTP 429 before giving up
@@ -61,6 +64,15 @@ func Load() (Config, error) {
 	if c.AnalyticsBatchSize, err = getenvInt("ANALYTICS_BATCH_SIZE", 20); err != nil {
 		return Config{}, err
 	}
+	if c.AnalyticsBatchDelay, err = getenvDuration("ANALYTICS_BATCH_DELAY", 2*time.Second); err != nil {
+		return Config{}, err
+	}
+	if c.AnalyticsQueueSize, err = getenvInt("ANALYTICS_QUEUE_SIZE", 200); err != nil {
+		return Config{}, err
+	}
+	if c.AnalyticsBatchGrace, err = getenvDuration("ANALYTICS_BATCH_GRACE", 30*time.Second); err != nil {
+		return Config{}, err
+	}
 	if c.AnalyticsRateRequest, err = getenvInt("ANALYTICS_RATE_REQUESTS", 1); err != nil {
 		return Config{}, err
 	}
@@ -82,6 +94,10 @@ func (c Config) validate() error {
 		return fmt.Errorf("ENRICHMENT_BREAKER_TRIP must be >= 1, got %d", c.EnrichmentBreakerTrip)
 	case c.AnalyticsBatchSize < 1 || c.AnalyticsBatchSize > 20:
 		return fmt.Errorf("ANALYTICS_BATCH_SIZE must be between 1 and 20, got %d", c.AnalyticsBatchSize)
+	case c.AnalyticsBatchDelay <= 0:
+		return fmt.Errorf("ANALYTICS_BATCH_DELAY must be > 0, got %s", c.AnalyticsBatchDelay)
+	case c.AnalyticsQueueSize < 1:
+		return fmt.Errorf("ANALYTICS_QUEUE_SIZE must be >= 1, got %d", c.AnalyticsQueueSize)
 	case c.AnalyticsRateRequest < 1:
 		return fmt.Errorf("ANALYTICS_RATE_REQUESTS must be >= 1, got %d", c.AnalyticsRateRequest)
 	case c.AnalyticsRateWindow <= 0:

@@ -26,7 +26,7 @@ type ingestRequest struct {
 }
 
 // ingestResult mirrors the processor's response body. A 2xx only means the
-// chunk was accepted; the body says how many records actually reached the
+// request was accepted; the body says how many records actually reached the
 // Analytics Service, so the CLI reports that rather than assuming success.
 type ingestResult struct {
 	Received         int `json:"received"`
@@ -36,8 +36,8 @@ type ingestResult struct {
 	FailedCategory   int `json:"failedCategory"`
 	FailedAnalytics  int `json:"failedAnalytics"`
 
-	// accounted is false when the processor accepted the chunk but returned a
-	// body we could not read, so its per-record outcome is unknown.
+	// accounted is false when the processor accepted the request but returned
+	// a body we could not read, so its per-record outcome is unknown.
 	accounted bool
 }
 
@@ -45,14 +45,13 @@ func runIngest(args []string) int {
 	fs := flag.NewFlagSet("ingest", flag.ContinueOnError)
 	file := fs.String("file", "", "path to the CSV file to ingest (required)")
 	endpoint := fs.String("endpoint", defaultEndpoint, "processor ingest endpoint (env "+envEndpoint+")")
-	chunkSize := fs.Int("chunk-size", defaultChunkSize, "records to POST per request (env "+envChunkSize+")")
-	timeout := fs.Duration("timeout", 0, "per-chunk HTTP timeout; default is derived from -chunk-size (env "+envTimeout+")")
+	timeout := fs.Duration("timeout", 0, "HTTP timeout; default is derived from the number of records (env "+envTimeout+")")
 	dryRun := fs.Bool("dry-run", false, "parse and filter but do not POST anything")
 	skipPreflight := fs.Bool("skip-preflight", false, "do not health-check the processor before ingesting")
 	var where stringSlice
 	fs.Var(&where, "where", "filter as column=value (exact) or column~value (contains); repeatable, ANDed")
 	fs.Usage = func() {
-		fmt.Fprintf(fs.Output(), "Ingest a telemetry CSV and POST records to the processor.\n\nUsage:\n  telemetryingestor ingest -file <path> [-endpoint <url>] [-chunk-size <n>] [-timeout <dur>] [-where <expr>] [-dry-run] [-skip-preflight]\n\nFlags:\n")
+		fmt.Fprintf(fs.Output(), "Ingest a telemetry CSV and POST its records to the processor.\n\nUsage:\n  telemetryingestor ingest -file <path> [-endpoint <url>] [-timeout <dur>] [-where <expr>] [-dry-run] [-skip-preflight]\n\nFlags:\n")
 		fs.PrintDefaults()
 	}
 	if err := fs.Parse(args); err != nil {
@@ -66,17 +65,6 @@ func runIngest(args []string) int {
 
 	// Resolve configuration precedence: flag > env > default.
 	resolvedEndpoint := resolveEndpoint(*endpoint, flagWasSet(fs, "endpoint"))
-	resolvedChunk, err := resolveChunkSize(*chunkSize, flagWasSet(fs, "chunk-size"))
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "error:", err)
-		return 2
-	}
-
-	resolvedTimeout, err := resolveTimeout(*timeout, flagWasSet(fs, "timeout"), resolvedChunk)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "error:", err)
-		return 2
-	}
 
 	flt, err := filter.Parse(where)
 	if err != nil {
@@ -84,7 +72,14 @@ func runIngest(args []string) int {
 		return 2
 	}
 
-	send, verb := chunkSender(*dryRun, &http.Client{Timeout: resolvedTimeout}, resolvedEndpoint)
+	// The derived timeout needs the record count, so it is resolved after the
+	// file is read. Check the explicit values now so a bad flag is a usage
+	// error rather than something reported halfway through a run.
+	timeoutSet := flagWasSet(fs, "timeout")
+	if _, err := resolveTimeout(*timeout, timeoutSet, 0); err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		return 2
+	}
 
 	if !*dryRun && !*skipPreflight {
 		probe := &http.Client{Timeout: defaultPreflightTimeout}
@@ -94,28 +89,8 @@ func runIngest(args []string) int {
 		}
 	}
 
-	f, err := os.Open(*file)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "error:", err)
-		return 1
-	}
-	defer f.Close()
-
-	rd := icsv.NewReader(f)
-	if _, err := rd.ReadHeader(); err != nil {
-		fmt.Fprintln(os.Stderr, "error:", err)
-		return 1
-	}
-
 	fmt.Printf("Ingesting %s\n", *file)
 	fmt.Printf("  endpoint:   %s\n", resolvedEndpoint)
-	fmt.Printf("  chunk size: %d\n", resolvedChunk)
-	if !*dryRun {
-		fmt.Printf("  timeout:    %s per chunk\n", resolvedTimeout)
-	}
-	if resolvedChunk > upstreamBatchSize {
-		fmt.Printf("  note:       chunks above %d span several rate-limited upstream requests\n", upstreamBatchSize)
-	}
 	if !flt.Empty() {
 		fmt.Printf("  filter:     %s\n", where.String())
 	}
@@ -126,47 +101,79 @@ func runIngest(args []string) int {
 	} else {
 		fmt.Println("  processor:  reachable and healthy")
 	}
-	fmt.Println()
 
 	stats := ingestStats{}
-	batch := make([]ingestRecord, 0, resolvedChunk)
-	chunkNum := 0
-
-	flush := func() {
-		if len(batch) == 0 {
-			return
-		}
-		chunkNum++
-		res, err := send(batch)
-		switch {
-		case err == nil && !res.accounted:
-			stats.accepted += len(batch)
-			stats.unaccounted += len(batch)
-			fmt.Printf("  chunk %d: %s %d records (processor returned no per-record counts)\n",
-				chunkNum, verb, len(batch))
-		case err == nil:
-			stats.accepted += len(batch)
-			stats.ingested += res.Ingested
-			stats.droppedCategory += res.FailedCategory
-			stats.droppedEnrichment += res.FailedEnrichment
-			stats.droppedAnalytics += res.FailedAnalytics
-			fmt.Printf("  chunk %d: %s %d records, %d ingested (%d total)\n",
-				chunkNum, verb, len(batch), res.Ingested, stats.ingested)
-		case isTimeout(err):
-			// The processor may well have finished the work after we hung up:
-			// calling this "failed" would be a lie, and a blind retry would
-			// duplicate records upstream.
-			stats.unknownChunks++
-			stats.unknownRecords += len(batch)
-			fmt.Fprintf(os.Stderr, "  chunk %d timed out (%d records, outcome unknown): %v\n", chunkNum, len(batch), err)
-		default:
-			stats.failedChunks++
-			stats.failedRecords += len(batch)
-			fmt.Fprintf(os.Stderr, "  chunk %d failed (%d records): %v\n", chunkNum, len(batch), err)
-		}
-		batch = batch[:0]
+	records, err := readRecords(*file, flt, &stats)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		return 1
 	}
 
+	// The timeout has to cover the upstream rate limit, which depends on how
+	// many records we are actually sending -- hence resolving it here.
+	resolvedTimeout, _ := resolveTimeout(*timeout, timeoutSet, len(records))
+
+	if len(records) == 0 {
+		fmt.Println("\nNothing to send.")
+		return stats.report(*dryRun)
+	}
+
+	if *dryRun {
+		stats.accepted = len(records)
+		stats.ingested = len(records)
+		return stats.report(true)
+	}
+
+	fmt.Printf("  records:    %d\n", len(records))
+	fmt.Printf("  estimated:  %s at %d records / %s (upstream rate limit)\n",
+		estimateDuration(len(records)).Round(estimateRounding), upstreamBatchSize, upstreamRateWindow)
+	fmt.Printf("  timeout:    %s\n\n", resolvedTimeout)
+	fmt.Println("  sending...")
+
+	res, err := postRecords(&http.Client{Timeout: resolvedTimeout}, resolvedEndpoint, records)
+	switch {
+	case err == nil && !res.accounted:
+		stats.accepted = len(records)
+		stats.unaccounted = len(records)
+		fmt.Println("  accepted (processor returned no per-record counts)")
+	case err == nil:
+		stats.accepted = len(records)
+		stats.ingested = res.Ingested
+		stats.droppedCategory = res.FailedCategory
+		stats.droppedEnrichment = res.FailedEnrichment
+		stats.droppedAnalytics = res.FailedAnalytics
+		fmt.Println("  done")
+	case isTimeout(err):
+		// The processor may well have finished the work after we hung up:
+		// calling this "failed" would be a lie, and a blind retry would
+		// duplicate records upstream.
+		stats.unknown = len(records)
+		fmt.Fprintf(os.Stderr, "  timed out (outcome unknown): %v\n", err)
+	default:
+		stats.failed = len(records)
+		fmt.Fprintf(os.Stderr, "  failed: %v\n", err)
+	}
+
+	return stats.report(false)
+}
+
+// readRecords streams the CSV once, applying the filter and counting the rows
+// it had to skip. The whole file is held in memory: at ~60 bytes per record
+// even a million rows is small next to the ~8 hours the rate limit would need
+// to send them.
+func readRecords(path string, flt filter.Filter, stats *ingestStats) ([]ingestRecord, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	rd := icsv.NewReader(f)
+	if _, err := rd.ReadHeader(); err != nil {
+		return nil, err
+	}
+
+	var records []ingestRecord
 	for {
 		rec, err := rd.Next()
 		if err == io.EOF {
@@ -177,9 +184,7 @@ func runIngest(args []string) int {
 				stats.skippedMalformed++
 				continue
 			}
-			flush()
-			fmt.Fprintln(os.Stderr, "error:", err)
-			return 1
+			return nil, err
 		}
 		stats.read++
 
@@ -194,26 +199,9 @@ func runIngest(args []string) int {
 			fmt.Fprintf(os.Stderr, "  skipping line %d: invalid id %q\n", rec.Line, rec.ID)
 			continue
 		}
-
-		batch = append(batch, ir)
-		if len(batch) >= resolvedChunk {
-			flush()
-		}
+		records = append(records, ir)
 	}
-	flush()
-
-	return stats.report(verb)
-}
-
-func chunkSender(dryRun bool, client *http.Client, endpoint string) (send func([]ingestRecord) (ingestResult, error), verb string) {
-	if dryRun {
-		return func(batch []ingestRecord) (ingestResult, error) {
-			return ingestResult{Received: len(batch), Ingested: len(batch), accounted: true}, nil
-		}, "would send"
-	}
-	return func(batch []ingestRecord) (ingestResult, error) {
-		return postChunk(client, endpoint, batch)
-	}, "sent"
+	return records, nil
 }
 
 func toIngestRecord(r icsv.Record) (ingestRecord, bool) {
@@ -229,7 +217,7 @@ func toIngestRecord(r icsv.Record) (ingestRecord, bool) {
 	}, true
 }
 
-func postChunk(client *http.Client, endpoint string, records []ingestRecord) (ingestResult, error) {
+func postRecords(client *http.Client, endpoint string, records []ingestRecord) (ingestResult, error) {
 	body, err := json.Marshal(ingestRequest{Records: records})
 	if err != nil {
 		return ingestResult{}, fmt.Errorf("marshalling request: %w", err)
@@ -271,19 +259,24 @@ type ingestStats struct {
 	droppedCategory   int
 	droppedEnrichment int
 	droppedAnalytics  int
-	failedRecords     int
-	failedChunks      int
-	unknownRecords    int
-	unknownChunks     int
+	failed            int
+	unknown           int
 }
 
+// statLabelWidth must be >= the longest label below ("dropped (enrichment):")
+// so every value lands in the same column.
 const statLabelWidth = 22
 
 func printStat(label string, value int) {
 	fmt.Printf("  %-*s%d\n", statLabelWidth, label, value)
 }
 
-func (s ingestStats) report(verb string) int {
+func (s ingestStats) report(dryRun bool) int {
+	verb := "sent:"
+	if dryRun {
+		verb = "would send:"
+	}
+
 	fmt.Println("\nSummary:")
 	printStat("rows read:", s.read)
 	if s.filteredOut > 0 {
@@ -295,8 +288,8 @@ func (s ingestStats) report(verb string) int {
 	if s.skippedInvalid > 0 {
 		printStat("skipped (bad id):", s.skippedInvalid)
 	}
-	printStat(verb+":", s.accepted)
-	if s.unaccounted < s.accepted {
+	printStat(verb, s.accepted)
+	if !dryRun && s.unaccounted < s.accepted {
 		printStat("ingested:", s.ingested)
 	}
 	if s.unaccounted > 0 {
@@ -313,14 +306,14 @@ func (s ingestStats) report(verb string) int {
 	}
 
 	exit := 0
-	if s.failedRecords > 0 {
-		fmt.Printf("  %-*s%d records in %d chunk(s)\n", statLabelWidth, "failed:", s.failedRecords, s.failedChunks)
+	if s.failed > 0 {
+		printStat("failed:", s.failed)
 		exit = 1
 	}
-	if s.unknownRecords > 0 {
-		fmt.Printf("  %-*s%d records in %d chunk(s)\n", statLabelWidth, "outcome unknown:", s.unknownRecords, s.unknownChunks)
-		fmt.Println("\nChunks that timed out may still have been ingested. Re-run with a longer\n" +
-			"-timeout, or a smaller -chunk-size, and expect duplicates for those records.")
+	if s.unknown > 0 {
+		printStat("outcome unknown:", s.unknown)
+		fmt.Println("\nThe request timed out but may still have been ingested. Re-run with a\n" +
+			"longer -timeout, and expect duplicates for these records.")
 		exit = 1
 	}
 	if s.ingested < s.accepted-s.unaccounted && exit == 0 {

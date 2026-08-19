@@ -82,12 +82,14 @@ For each record:
   **circuit breaker** that fails fast once the service is clearly down. A `400`
   is treated as a permanent per-record error and is not retried.
 - **Analytics** is rate limited to **1 request / 10 s** and accepts at most 20
-  items per request (see `/analytics` in `docs/openapi.json`). The client
-  batches to ≤ 20 and gates every *request* — including 429 retries — through a
-  **shared token-bucket limiter**, so the process stays within quota *even
-  across concurrent ingest requests*. Note the limit counts requests, not
-  items: a short trailing batch still costs a whole window. `429` responses are
-  retried, honouring `Retry-After`.
+  items per request (see `/analytics` in `docs/openapi.json`). Because a
+  request costs a whole window however full it is, the batch size *is* the
+  throughput — so a single process-wide **`analytics.Batcher`** collects
+  records from every in-flight ingest request and emits full 20-item batches.
+  A partial batch is flushed after `ANALYTICS_BATCH_DELAY` rather than being
+  stranded. Every *request* — including 429 retries — is gated through a
+  **shared token-bucket limiter**. `429` responses are retried, honouring
+  `Retry-After`.
 
 ## Configuration
 
@@ -107,7 +109,10 @@ process fails fast at startup on a malformed value.
 | `ENRICHMENT_BREAKER_TRIP`     | `5`                                    | Consecutive failures before the breaker opens (0 disables). |
 | `ENRICHMENT_BREAKER_COOLDOWN` | `15s`                                  | How long the breaker stays open.                   |
 | `ANALYTICS_TIMEOUT`           | `10s`                                  | Per-attempt HTTP timeout.                          |
-| `ANALYTICS_BATCH_SIZE`        | `20`                                   | Max events per request (1–20).                     |
+| `ANALYTICS_BATCH_SIZE`        | `20`                                   | Events per upstream request (1–20).                |
+| `ANALYTICS_BATCH_DELAY`       | `2s`                                   | How long a partial batch waits for company.        |
+| `ANALYTICS_QUEUE_SIZE`        | `200`                                  | Events buffered before ingest requests block.      |
+| `ANALYTICS_BATCH_GRACE`       | `30s`                                  | Budget for delivering queued events at shutdown.   |
 | `ANALYTICS_RATE_REQUESTS`     | `1`                                    | Requests permitted per window (upstream allows 1). |
 | `ANALYTICS_RATE_WINDOW`       | `10s`                                  | The rate-limit window.                             |
 | `ANALYTICS_MAX_RETRIES`       | `5`                                    | Retries on HTTP 429.                               |
@@ -133,12 +138,16 @@ bottleneck: **20 records per 10 s, ~8.5 minutes for a 1000-row file**, and no
 amount of client-side concurrency changes that. A single `/ingest` call
 carrying *N* records blocks for roughly `(ceil(N/20) - 1) × 10s`.
 
-Because the limiter is **shared**, splitting a file into many small CLI
-requests does **not** exceed the global quota. The CLI therefore defaults
-`-chunk-size` to **20** — one chunk is exactly one upstream request — and
-derives its HTTP timeout from that, so a chunk can never be cancelled just for
-obeying the rate limit. Larger chunks work but hold one HTTP request open
-across several windows, putting more records at risk if the connection drops.
+Batching happens **once, process-wide**, not per HTTP request. That matters:
+if each request batched its own records, two clients posting 25 each would burn
+four windows on 50 records instead of three, and every short trailing batch
+would waste a full window. With the shared batcher the client's request size is
+irrelevant to upstream efficiency — which is why the CLI no longer chunks at
+all and simply posts the whole file.
+
+Backpressure falls out of the same design: `Batcher.Submit` blocks once the
+queue is full, so a large ingest is throttled by the rate limit rather than
+piling up in memory.
 
 The honest next step for production is to stop modelling this as a synchronous
 call: have `/ingest` return `202` with a job id and drain the queue in the

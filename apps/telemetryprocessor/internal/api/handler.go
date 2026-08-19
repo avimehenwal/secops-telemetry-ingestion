@@ -13,9 +13,14 @@ import (
 
 const maxRecordErrors = 100
 
+type pendingRecord struct {
+	id     int64
+	result <-chan error
+}
+
 type IngestHandler struct {
 	Enrichment *enrichment.Client
-	Analytics  *analytics.Client
+	Analytics  *analytics.Batcher
 	Logger     *log.Logger
 }
 
@@ -42,7 +47,7 @@ func (h *IngestHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	result := model.IngestResult{Received: len(req.Records), DryRun: dryRun}
 
-	events := make([]model.AnalyticsEvent, 0, len(req.Records))
+	pending := make([]pendingRecord, 0, len(req.Records))
 	for _, rec := range req.Records {
 		cat, ok := category.Normalize(rec.Category)
 		if !ok {
@@ -73,24 +78,29 @@ func (h *IngestHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		result.Enriched++
 
-		events = append(events, model.AnalyticsEvent{
-			ID:            rec.ID,
-			Asset:         rec.Asset,
-			IP:            rec.IP,
-			Category:      details.Category,
-			ASN:           details.ASN,
-			CorrelationID: details.CorrelationID,
+		pending = append(pending, pendingRecord{
+			id: rec.ID,
+			result: h.Analytics.Submit(ctx, model.AnalyticsEvent{
+				ID:            rec.ID,
+				Asset:         rec.Asset,
+				IP:            rec.IP,
+				Category:      details.Category,
+				ASN:           details.ASN,
+				CorrelationID: details.CorrelationID,
+			}),
 		})
 	}
 
-	if len(events) > 0 && !dryRun {
-		ingested, err := h.Analytics.Send(ctx, events)
-		result.Ingested = ingested
-		if err != nil {
-			result.FailedAnalytics = len(events) - ingested
-			h.addErr(&result, 0, "analytics", err.Error())
-			h.logf("analytics send failed after %d/%d ingested: %v", ingested, len(events), err)
+	for _, p := range pending {
+		if err := <-p.result; err != nil {
+			result.FailedAnalytics++
+			h.addErr(&result, p.id, "analytics", err.Error())
+			continue
 		}
+		result.Ingested++
+	}
+	if result.FailedAnalytics > 0 {
+		h.logf("analytics delivery failed for %d/%d records", result.FailedAnalytics, len(pending))
 	}
 
 	h.logf("ingest complete: dryRun=%t received=%d enriched=%d ingested=%d failedCategory=%d failedEnrichment=%d failedAnalytics=%d",

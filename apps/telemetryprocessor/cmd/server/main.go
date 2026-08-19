@@ -25,6 +25,23 @@ func main() {
 		logger.Fatalf("configuration error: %v", err)
 	}
 
+	analyticsClient := analytics.NewClient(cfg.AnalyticsURL, cfg.APIKey, analytics.Options{
+		Timeout:      cfg.AnalyticsTimeout,
+		RateRequests: cfg.AnalyticsRateRequest,
+		RateWindow:   cfg.AnalyticsRateWindow,
+		MaxRetries:   cfg.AnalyticsMaxRetries,
+	})
+
+	batcher := analytics.NewBatcher(analyticsClient.SendBatch, analytics.BatcherOptions{
+		BatchSize: cfg.AnalyticsBatchSize,
+		MaxDelay:  cfg.AnalyticsBatchDelay,
+		QueueSize: cfg.AnalyticsQueueSize,
+		Grace:     cfg.AnalyticsBatchGrace,
+	})
+	batcherCtx, stopBatcher := context.WithCancel(context.Background())
+	defer stopBatcher()
+	go batcher.Run(batcherCtx)
+
 	handler := &api.IngestHandler{
 		Enrichment: enrichment.NewClient(cfg.EnrichmentURL, cfg.APIKey, enrichment.Options{
 			Timeout:         cfg.EnrichmentTimeout,
@@ -34,14 +51,8 @@ func main() {
 			BreakerTrip:     cfg.EnrichmentBreakerTrip,
 			BreakerCooldown: cfg.EnrichmentBreakerCooldown,
 		}),
-		Analytics: analytics.NewClient(cfg.AnalyticsURL, cfg.APIKey, analytics.Options{
-			Timeout:      cfg.AnalyticsTimeout,
-			BatchSize:    cfg.AnalyticsBatchSize,
-			RateRequests: cfg.AnalyticsRateRequest,
-			RateWindow:   cfg.AnalyticsRateWindow,
-			MaxRetries:   cfg.AnalyticsMaxRetries,
-		}),
-		Logger: logger,
+		Analytics: batcher,
+		Logger:    logger,
 	}
 
 	mux := http.NewServeMux()
@@ -82,5 +93,8 @@ func main() {
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		logger.Printf("graceful shutdown failed: %v", err)
 	}
+
+	stopBatcher()
+	batcher.Wait()
 	logger.Println("stopped")
 }

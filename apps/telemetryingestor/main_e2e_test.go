@@ -124,21 +124,23 @@ func (p *fakeProcessor) received() [][]ingestRecord {
 
 func (p *fakeProcessor) endpoint() string { return p.URL + "/ingest" }
 
-func TestIngestPostsRecordsInChunks(t *testing.T) {
+// The CLI does not chunk: the file goes up as one request, and the processor
+// decides how to batch it upstream.
+func TestIngestPostsEveryRecordInOneRequest(t *testing.T) {
 	proc := newFakeProcessor(t, http.StatusOK)
 	csv := writeCSV(t, sampleCSV)
 
-	got := run(t, nil, "ingest", "-file", csv, "-endpoint", proc.endpoint(), "-chunk-size", "2")
+	got := run(t, nil, "ingest", "-file", csv, "-endpoint", proc.endpoint())
 
 	if got.code != 0 {
 		t.Fatalf("exit code = %d, want 0\nstderr: %s", got.code, got.stderr)
 	}
 	batches := proc.received()
-	if len(batches) != 2 {
-		t.Fatalf("got %d batches, want 2 (chunk-size 2 over 3 records)", len(batches))
+	if len(batches) != 1 {
+		t.Fatalf("got %d requests, want exactly 1", len(batches))
 	}
-	if len(batches[0]) != 2 || len(batches[1]) != 1 {
-		t.Errorf("batch sizes = %d,%d; want 2,1", len(batches[0]), len(batches[1]))
+	if len(batches[0]) != 3 {
+		t.Errorf("request carried %d records, want all 3", len(batches[0]))
 	}
 	want := ingestRecord{ID: 1, Asset: "laptop-01", IP: "10.0.0.1", Category: "phishing"}
 	if batches[0][0] != want {
@@ -226,10 +228,10 @@ func TestIngestFailsWhenProcessorRejects(t *testing.T) {
 	got := run(t, nil, "ingest", "-file", csv, "-endpoint", proc.endpoint())
 
 	if got.code == 0 {
-		t.Fatalf("exit code = 0, want non-zero on a failed chunk\nstdout: %s", got.stdout)
+		t.Fatalf("exit code = 0, want non-zero on a rejected request\nstdout: %s", got.stdout)
 	}
-	if !strings.Contains(got.stderr, "chunk 1 failed") {
-		t.Errorf("stderr does not report the failed chunk:\n%s", got.stderr)
+	if !strings.Contains(got.stderr, "failed:") {
+		t.Errorf("stderr does not report the failure:\n%s", got.stderr)
 	}
 }
 
@@ -267,7 +269,7 @@ func TestUsageErrorsExitTwo(t *testing.T) {
 		{"ingest without -file", []string{"ingest"}},
 		{"validate without -file", []string{"validate", "-file", ""}},
 		{"malformed -where", []string{"ingest", "-file", "x.csv", "-where", "nonsense"}},
-		{"non-positive -chunk-size", []string{"ingest", "-file", "x.csv", "-chunk-size", "0"}},
+		{"non-positive -timeout", []string{"ingest", "-file", "x.csv", "-timeout", "0s"}},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -360,13 +362,13 @@ func TestSkipPreflightAttemptsIngestAnyway(t *testing.T) {
 	got := run(t, nil, "ingest", "-file", writeCSV(t, sampleCSV), "-endpoint", endpoint, "-skip-preflight")
 
 	if got.code != 1 {
-		t.Fatalf("exit code = %d, want 1 (the chunks still fail)\nstderr: %s", got.code, got.stderr)
+		t.Fatalf("exit code = %d, want 1 (the request still fails)\nstderr: %s", got.code, got.stderr)
 	}
 	if strings.Contains(got.stderr, "pre-check failed") {
 		t.Errorf("-skip-preflight did not skip the pre-check:\n%s", got.stderr)
 	}
-	if !strings.Contains(got.stderr, "chunk 1 failed") {
-		t.Errorf("expected the ingest to be attempted and fail per chunk:\n%s", got.stderr)
+	if !strings.Contains(got.stderr, "failed:") {
+		t.Errorf("expected the ingest to be attempted and fail:\n%s", got.stderr)
 	}
 }
 
@@ -425,33 +427,29 @@ func TestHealthURLDerivation(t *testing.T) {
 	}
 }
 
-// The default chunk maps 1:1 onto an upstream Analytics request, and the
-// derived timeout must leave room for the rate-limit window each extra
-// request costs. A fixed timeout is what made every default run fail.
-func TestEstimateTimeoutTracksChunkSize(t *testing.T) {
+// The timeout must leave room for the rate-limit window every batch beyond the
+// first has to wait through. A fixed timeout is what made large runs fail.
+func TestEstimateTimeoutTracksRecordCount(t *testing.T) {
 	tests := []struct {
-		chunk int
-		want  time.Duration
+		records int
+		want    time.Duration
 	}{
 		{1, timeoutSlack},
 		{20, timeoutSlack},
 		{21, upstreamRateWindow + timeoutSlack},
 		{100, 4*upstreamRateWindow + timeoutSlack},
+		{999, 49*upstreamRateWindow + timeoutSlack},
 	}
 	for _, tc := range tests {
-		if got := estimateTimeout(tc.chunk); got != tc.want {
-			t.Errorf("estimateTimeout(%d) = %s, want %s", tc.chunk, got, tc.want)
+		if got := estimateTimeout(tc.records); got != tc.want {
+			t.Errorf("estimateTimeout(%d) = %s, want %s", tc.records, got, tc.want)
 		}
-	}
-	if defaultChunkSize != upstreamBatchSize {
-		t.Errorf("defaultChunkSize = %d, want %d so one chunk is one upstream request",
-			defaultChunkSize, upstreamBatchSize)
 	}
 }
 
-// A chunk that times out may still have been ingested. Reporting it as failed
-// would be false, and would invite a retry that duplicates records upstream.
-func TestIngestReportsTimedOutChunkAsUnknown(t *testing.T) {
+// A request that times out may still have been ingested. Reporting it as
+// failed would be false, and would invite a retry that duplicates records.
+func TestIngestReportsTimeoutAsUnknown(t *testing.T) {
 	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/health" {
 			_, _ = w.Write([]byte(`{"status":"ok"}`))
@@ -468,10 +466,10 @@ func TestIngestReportsTimedOutChunkAsUnknown(t *testing.T) {
 		t.Fatalf("exit code = %d, want 1\nstdout: %s", got.code, got.stdout)
 	}
 	if !strings.Contains(got.stderr, "outcome unknown") {
-		t.Errorf("timed-out chunk not reported as unknown:\n%s", got.stderr)
+		t.Errorf("timed-out request not reported as unknown:\n%s", got.stderr)
 	}
-	if strings.Contains(got.stderr, "failed (") {
-		t.Errorf("a timeout must not be reported as an outright failure:\n%s", got.stderr)
+	if strings.Contains(got.stdout, "failed:") {
+		t.Errorf("a timeout must not be reported as an outright failure:\n%s", got.stdout)
 	}
 	if !strings.Contains(got.stdout, "outcome unknown:") {
 		t.Errorf("summary does not carry the unknown records:\n%s", got.stdout)

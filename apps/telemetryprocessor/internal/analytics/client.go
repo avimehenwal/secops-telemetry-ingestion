@@ -18,55 +18,37 @@ const UpstreamMaxBatchSize = 20
 
 type Options struct {
 	Timeout      time.Duration // per-attempt HTTP timeout
-	BatchSize    int           // max events per request (clamped to UpstreamMaxBatchSize)
 	RateRequests int           // requests permitted per RateWindow (upstream allows 1)
 	RateWindow   time.Duration // the rate-limit window
 	MaxRetries   int           // retries on HTTP 429
 }
 
 type Client struct {
-	baseURL   string
-	apiKey    string
-	http      *http.Client
-	batchSize int
-	maxRetry  int
-	limiter   *ratelimit.Bucket
+	baseURL  string
+	apiKey   string
+	http     *http.Client
+	maxRetry int
+	limiter  *ratelimit.Bucket
 }
 
 func NewClient(baseURL, apiKey string, opts Options) *Client {
-	batch := opts.BatchSize
-	if batch < 1 || batch > UpstreamMaxBatchSize {
-		batch = UpstreamMaxBatchSize
-	}
 	return &Client{
-		baseURL:   baseURL,
-		apiKey:    apiKey,
-		http:      &http.Client{Timeout: opts.Timeout},
-		batchSize: batch,
-		maxRetry:  opts.MaxRetries,
-		limiter:   ratelimit.New(opts.RateRequests, opts.RateWindow),
+		baseURL:  baseURL,
+		apiKey:   apiKey,
+		http:     &http.Client{Timeout: opts.Timeout},
+		maxRetry: opts.MaxRetries,
+		limiter:  ratelimit.New(opts.RateRequests, opts.RateWindow),
 	}
 }
 
-func (c *Client) Send(ctx context.Context, events []model.AnalyticsEvent) (int, error) {
-	ingested := 0
-	for start := 0; start < len(events); start += c.batchSize {
-		end := start + c.batchSize
-		if end > len(events) {
-			end = len(events)
-		}
-		batch := events[start:end]
-
-		n, err := c.sendBatch(ctx, batch)
-		ingested += n
-		if err != nil {
-			return ingested, err
-		}
+func (c *Client) SendBatch(ctx context.Context, batch []model.AnalyticsEvent) (int, error) {
+	if len(batch) == 0 {
+		return 0, nil
 	}
-	return ingested, nil
-}
+	if len(batch) > UpstreamMaxBatchSize {
+		return 0, fmt.Errorf("batch of %d exceeds the upstream maximum of %d", len(batch), UpstreamMaxBatchSize)
+	}
 
-func (c *Client) sendBatch(ctx context.Context, batch []model.AnalyticsEvent) (int, error) {
 	body, err := json.Marshal(batch)
 	if err != nil {
 		return 0, fmt.Errorf("marshalling analytics batch: %w", err)

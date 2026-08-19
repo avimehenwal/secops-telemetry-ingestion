@@ -21,19 +21,16 @@ func events(n int) []model.AnalyticsEvent {
 	return out
 }
 
-// fastOpts keeps the rate limit high so batching/retry logic is exercised
-// without slowing the test.
 func fastOpts() Options {
 	return Options{
 		Timeout:      2 * time.Second,
-		BatchSize:    20,
 		RateRequests: 1000,
 		RateWindow:   time.Second,
 		MaxRetries:   3,
 	}
 }
 
-func TestSendBatchesAndCountsIngested(t *testing.T) {
+func TestSendBatchCountsIngested(t *testing.T) {
 	var (
 		mu       sync.Mutex
 		batchLen []int
@@ -57,16 +54,22 @@ func TestSendBatchesAndCountsIngested(t *testing.T) {
 	defer srv.Close()
 
 	c := NewClient(srv.URL, "k", fastOpts())
-	got, err := c.Send(context.Background(), events(45))
+	got, err := c.SendBatch(context.Background(), events(20))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got != 45 {
-		t.Fatalf("ingested = %d, want 45", got)
+	if got != 20 {
+		t.Fatalf("ingested = %d, want 20", got)
 	}
-	// 45 events with batch size 20 => 20, 20, 5.
-	if len(batchLen) != 3 || batchLen[0] != 20 || batchLen[1] != 20 || batchLen[2] != 5 {
-		t.Fatalf("unexpected batching: %v", batchLen)
+	if len(batchLen) != 1 || batchLen[0] != 20 {
+		t.Fatalf("unexpected requests: %v", batchLen)
+	}
+}
+
+func TestSendBatchRejectsOversizedBatch(t *testing.T) {
+	c := NewClient("http://unused", "k", fastOpts())
+	if _, err := c.SendBatch(context.Background(), events(21)); err == nil {
+		t.Fatal("expected an error for a batch above the upstream maximum")
 	}
 }
 
@@ -83,7 +86,7 @@ func TestSendRetriesOn429(t *testing.T) {
 	defer srv.Close()
 
 	c := NewClient(srv.URL, "k", fastOpts())
-	got, err := c.Send(context.Background(), events(3))
+	got, err := c.SendBatch(context.Background(), events(3))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -104,22 +107,19 @@ func TestSendRateLimitThrottles(t *testing.T) {
 	defer srv.Close()
 
 	// The upstream limit is 1 *request* per window (see openapi.json), so two
-	// batches must straddle at least one full window.
+	// requests must straddle at least one full window.
 	opts := fastOpts()
 	opts.RateRequests = 1
 	opts.RateWindow = 200 * time.Millisecond
 	c := NewClient(srv.URL, "k", opts)
 
 	start := time.Now()
-	got, err := c.Send(context.Background(), events(40))
-	elapsed := time.Since(start)
-	if err != nil {
-		t.Fatal(err)
+	for i := 0; i < 2; i++ {
+		if _, err := c.SendBatch(context.Background(), events(20)); err != nil {
+			t.Fatal(err)
+		}
 	}
-	if got != 40 {
-		t.Fatalf("ingested = %d, want 40", got)
-	}
-	if elapsed < 180*time.Millisecond {
+	if elapsed := time.Since(start); elapsed < 180*time.Millisecond {
 		t.Fatalf("expected rate limiting to add ~200ms, only took %v", elapsed)
 	}
 }
@@ -138,13 +138,13 @@ func TestSendRateLimitsShortBatchesPerRequest(t *testing.T) {
 	opts := fastOpts()
 	opts.RateRequests = 1
 	opts.RateWindow = 200 * time.Millisecond
-	opts.BatchSize = 2
 	c := NewClient(srv.URL, "k", opts)
 
-	// 3 events at batch size 2 => 2 requests, the second one short.
 	start := time.Now()
-	if _, err := c.Send(context.Background(), events(3)); err != nil {
-		t.Fatal(err)
+	for _, n := range []int{20, 1} {
+		if _, err := c.SendBatch(context.Background(), events(n)); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if elapsed := time.Since(start); elapsed < 180*time.Millisecond {
 		t.Fatalf("short batch skipped the rate limiter: 2 requests took only %v", elapsed)

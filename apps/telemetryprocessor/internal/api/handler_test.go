@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -13,15 +14,28 @@ import (
 	"github.com/avimehenwal/secops-telemetry-ingestion/apps/telemetryprocessor/internal/model"
 )
 
-func newHandler(enrichURL, analyticsURL string) *IngestHandler {
+func newHandler(t *testing.T, enrichURL, analyticsURL string) *IngestHandler {
+	t.Helper()
+
+	client := analytics.NewClient(analyticsURL, "k", analytics.Options{
+		Timeout: time.Second, RateRequests: 1000, RateWindow: time.Second, MaxRetries: 2,
+	})
+	batcher := analytics.NewBatcher(client.SendBatch, analytics.BatcherOptions{
+		BatchSize: 20, MaxDelay: 10 * time.Millisecond,
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	go batcher.Run(ctx)
+	t.Cleanup(func() {
+		cancel()
+		batcher.Wait()
+	})
+
 	return &IngestHandler{
 		Enrichment: enrichment.NewClient(enrichURL, "k", enrichment.Options{
 			Timeout: time.Second, MaxAttempts: 2, BackoffBase: time.Millisecond,
 			BackoffMax: time.Millisecond, BreakerTrip: 100, BreakerCooldown: time.Second,
 		}),
-		Analytics: analytics.NewClient(analyticsURL, "k", analytics.Options{
-			Timeout: time.Second, BatchSize: 20, RateRequests: 1000, RateWindow: time.Second, MaxRetries: 2,
-		}),
+		Analytics: batcher,
 	}
 }
 
@@ -53,7 +67,7 @@ func TestHandlerHappyPath(t *testing.T) {
 	}))
 	defer analyticsSrv.Close()
 
-	h := newHandler(enrichSrv.URL, analyticsSrv.URL)
+	h := newHandler(t, enrichSrv.URL, analyticsSrv.URL)
 	w, res := post(t, h, model.IngestRequest{Records: []model.Record{
 		{ID: 1, Asset: "a", IP: "1.2.3.4", Category: "phising"}, // messy spelling -> normalised
 		{ID: 2, Asset: "b", IP: "5.6.7.8", Category: "valid accounts"},
@@ -82,7 +96,7 @@ func TestHandlerUnknownCategorySkipped(t *testing.T) {
 	}))
 	defer analyticsSrv.Close()
 
-	h := newHandler(enrichSrv.URL, analyticsSrv.URL)
+	h := newHandler(t, enrichSrv.URL, analyticsSrv.URL)
 	_, res := post(t, h, model.IngestRequest{Records: []model.Record{
 		{ID: 1, Asset: "a", IP: "1.2.3.4", Category: "totally-unknown"},
 		{ID: 2, Asset: "b", IP: "5.6.7.8", Category: "phishing"},
@@ -106,7 +120,7 @@ func TestHandlerEnrichmentFailureReported(t *testing.T) {
 	}))
 	defer analyticsSrv.Close()
 
-	h := newHandler(enrichSrv.URL, analyticsSrv.URL)
+	h := newHandler(t, enrichSrv.URL, analyticsSrv.URL)
 	w, res := post(t, h, model.IngestRequest{Records: []model.Record{
 		{ID: 1, Asset: "a", IP: "1.2.3.4", Category: "phishing"},
 	}})
@@ -130,7 +144,7 @@ func TestHandlerDryRunSkipsMicroservices(t *testing.T) {
 	}))
 	defer analyticsSrv.Close()
 
-	h := newHandler(enrichSrv.URL, analyticsSrv.URL)
+	h := newHandler(t, enrichSrv.URL, analyticsSrv.URL)
 	body, _ := json.Marshal(model.IngestRequest{Records: []model.Record{
 		{ID: 1, Asset: "a", IP: "1.2.3.4", Category: "phising"},       // valid -> would ingest
 		{ID: 2, Asset: "b", IP: "5.6.7.8", Category: "totally-bogus"}, // bad category
@@ -157,7 +171,7 @@ func TestHandlerDryRunSkipsMicroservices(t *testing.T) {
 }
 
 func TestHandlerRejectsNonPost(t *testing.T) {
-	h := newHandler("http://unused", "http://unused")
+	h := newHandler(t, "http://unused", "http://unused")
 	r := httptest.NewRequest(http.MethodGet, "/ingest", nil)
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, r)
@@ -167,7 +181,7 @@ func TestHandlerRejectsNonPost(t *testing.T) {
 }
 
 func TestHandlerRejectsBadJSON(t *testing.T) {
-	h := newHandler("http://unused", "http://unused")
+	h := newHandler(t, "http://unused", "http://unused")
 	r := httptest.NewRequest(http.MethodPost, "/ingest", bytes.NewReader([]byte("{not json")))
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, r)
