@@ -46,7 +46,7 @@ flowchart TB
     ENRICH -.-> ENRSVC(["Enrichment Service"])
     SEND -.-> ANASVC(["Analytics Service"])
     SEND -.->|"per-record result<br/>(one buffered chan each)"| HANDLER
-    HANDLER ==>|"received / enriched / ingested / failed*"| POST
+    HANDLER ==>|"NDJSON progress stream<br/>then final counts"| POST
 
     QUEUE -.->|"full ⇒ Submit blocks<br/><b>backpressure</b>"| SUBMIT
 ```
@@ -56,7 +56,7 @@ flowchart TB
 | Stage          | Goroutines           | Notes                                                             |
 | -------------- | -------------------- | ----------------------------------------------------------------- |
 | CLI            | 1                    | Reads, filters, sends, waits. Deliberately dull.                  |
-| Ingest handler | one per HTTP request | Enriches its own records sequentially, then waits on its results. |
+| Ingest handler | 2 per HTTP request   | A producer (normalise → enrich → submit) and a consumer that settles records in order and streams progress back. |
 | Enrichment     | inside the handler   | **Not** parallelised — see below.                                 |
 | Batcher        | exactly 1            | Owns all batching; the only writer to the Analytics client.       |
 | Rate limiter   | shared token bucket  | One token per _request_, 429 retries included.                    |

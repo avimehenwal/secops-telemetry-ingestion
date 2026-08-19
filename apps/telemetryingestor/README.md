@@ -67,6 +67,10 @@ Ingesting docs/example_data_2.csv
   timeout:    2m0s
 
   sending...
+  [ 20/196]  10.2% | enriched 36 | elapsed 12s | eta 1m45s
+  [ 40/196]  20.4% | enriched 56 | elapsed 22s | eta 1m26s
+  [ 60/196]  30.6% | enriched 76 | elapsed 32s | eta 1m13s
+  ...
   done
 
 Summary:
@@ -76,6 +80,27 @@ Summary:
   sent:                 196
   ingested:             196
 ```
+
+### Progress reporting
+
+A large ingest is one long request — 998 records take about 8 minutes — so the
+processor streams progress back as newline-delimited JSON and the CLI prints a
+line per upstream batch (roughly one per 10 s rate-limit window).
+
+`ingested` is the headline number because it is the only one that means a record
+reached the Analytics Service. `enriched` is shown next to it on purpose: the
+gap between the two **is** the processor's queue depth, so you can watch
+backpressure open up and then close as the run drains.
+
+The `eta` is extrapolated from the observed rate rather than the up-front
+estimate, so it self-corrects — the estimate assumes perfectly full batches,
+which a run that drops records never achieves.
+
+If the stream stops before the final result — the processor died, or something
+cut the connection — the CLI reports **`outcome unknown`** rather than
+summarising a partial run as success. Records already forwarded upstream stay
+forwarded, so this is the same situation as a timeout and gets the same
+treatment.
 
 `sent` is what the processor accepted; `ingested` is what it confirms reached
 the Analytics Service, read from the response body. They differ when records

@@ -39,6 +39,8 @@ type AnalyticsSuccessResponse struct {
 }
 
 type IngestResult struct {
+	Type string `json:"type,omitempty"`
+
 	Received         int           `json:"received"`
 	Enriched         int           `json:"enriched"`
 	Ingested         int           `json:"ingested"`

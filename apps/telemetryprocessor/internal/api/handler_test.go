@@ -238,3 +238,98 @@ func TestHandlerAnalyticsTotalFailureIsBadGateway(t *testing.T) {
 		t.Fatalf("unexpected result: %+v", res)
 	}
 }
+
+func TestHandlerStreamsProgress(t *testing.T) {
+	enrichSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var in model.Logline
+		_ = json.NewDecoder(r.Body).Decode(&in)
+		_ = json.NewEncoder(w).Encode(model.EnrichmentDetails{ASN: "ASN1", Category: "T1566", CorrelationID: in.ID})
+	}))
+	defer enrichSrv.Close()
+	analyticsSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var batch []model.AnalyticsEvent
+		_ = json.NewDecoder(r.Body).Decode(&batch)
+		_ = json.NewEncoder(w).Encode(model.AnalyticsSuccessResponse{Status: "ok", ItemsIngested: int64(len(batch))})
+	}))
+	defer analyticsSrv.Close()
+
+	// 45 records => progress at 20 and 40, then the result.
+	records := make([]model.Record, 45)
+	for i := range records {
+		records[i] = model.Record{ID: int64(i + 1), Asset: "a", IP: "1.2.3.4", Category: "phishing"}
+	}
+
+	h := newHandler(t, enrichSrv.URL, analyticsSrv.URL)
+	body, _ := json.Marshal(model.IngestRequest{Records: records})
+	r := httptest.NewRequest(http.MethodPost, "/ingest", bytes.NewReader(body))
+	r.Header.Set("Accept", ndjsonContentType)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+
+	if ct := w.Header().Get("Content-Type"); ct != ndjsonContentType {
+		t.Fatalf("Content-Type = %q, want %q", ct, ndjsonContentType)
+	}
+
+	var progress []model.IngestResult
+	var final *model.IngestResult
+	dec := json.NewDecoder(w.Body)
+	for {
+		var ev model.IngestResult
+		if err := dec.Decode(&ev); err != nil {
+			break
+		}
+		switch ev.Type {
+		case "progress":
+			progress = append(progress, ev)
+		case "result":
+			ev := ev
+			final = &ev
+		}
+	}
+
+	if len(progress) != 2 {
+		t.Fatalf("got %d progress events, want 2", len(progress))
+	}
+	// Progress must actually progress, and never overstate the final tally.
+	if progress[0].Ingested != 20 || progress[1].Ingested != 40 {
+		t.Fatalf("progress ingested counts = %d, %d; want 20, 40",
+			progress[0].Ingested, progress[1].Ingested)
+	}
+	if final == nil {
+		t.Fatal("stream ended without a result event")
+	}
+	if final.Ingested != 45 || final.Received != 45 {
+		t.Fatalf("final result = %+v, want 45 received and ingested", *final)
+	}
+}
+
+// Without the Accept header the response must be exactly what it always was.
+func TestHandlerDoesNotStreamWithoutAcceptHeader(t *testing.T) {
+	enrichSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var in model.Logline
+		_ = json.NewDecoder(r.Body).Decode(&in)
+		_ = json.NewEncoder(w).Encode(model.EnrichmentDetails{ASN: "ASN1", Category: "T1566", CorrelationID: in.ID})
+	}))
+	defer enrichSrv.Close()
+	analyticsSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var batch []model.AnalyticsEvent
+		_ = json.NewDecoder(r.Body).Decode(&batch)
+		_ = json.NewEncoder(w).Encode(model.AnalyticsSuccessResponse{Status: "ok", ItemsIngested: int64(len(batch))})
+	}))
+	defer analyticsSrv.Close()
+
+	h := newHandler(t, enrichSrv.URL, analyticsSrv.URL)
+	w, res := post(t, h, model.IngestRequest{Records: []model.Record{
+		{ID: 1, Asset: "a", IP: "1.2.3.4", Category: "phishing"},
+	}})
+
+	if ct := w.Header().Get("Content-Type"); ct != "application/json" {
+		t.Fatalf("Content-Type = %q, want application/json", ct)
+	}
+	if res.Type != "" {
+		t.Fatalf("non-streaming response leaked a type discriminator: %q", res.Type)
+	}
+	if res.Ingested != 1 {
+		t.Fatalf("unexpected result: %+v", res)
+	}
+}

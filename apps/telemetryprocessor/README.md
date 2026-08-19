@@ -36,6 +36,40 @@ actionable feedback:
 API is out of scope. In production this would sit behind the same gateway auth
 as the rest of the estate.
 
+### Progress streaming
+
+A client that sends `Accept: application/x-ndjson` gets **newline-delimited
+JSON** instead of one object: a `progress` line every 20 records, then a final
+`result` line with the full tally. Anything else gets the single-JSON response
+above, byte for byte — the stream is opt-in, so an older client still works.
+
+```bash
+curl -sS -N -X POST http://localhost:8080/ingest \
+  -H 'Content-Type: application/json' -H 'Accept: application/x-ndjson' \
+  -d '{"records":[...]}'
+```
+
+```json
+{"type":"progress","received":85,"enriched":36,"ingested":20,...}
+{"type":"progress","received":85,"enriched":56,"ingested":40,...}
+{"type":"result","received":85,"enriched":85,"ingested":85,...}
+```
+
+This matters because an 8-minute run is otherwise completely silent. Two
+consequences worth knowing:
+
+- **The status code is committed with the first byte,** so a wholesale failure
+  can no longer be a `502` — it is reported in the final event's counts. That
+  costs nothing in practice, because the CLI derives its exit code from the
+  counts anyway.
+- **A stream that ends without a `result` is not a success.** Clients must treat
+  truncation as *outcome unknown*, exactly like a timeout — records already
+  forwarded stay forwarded, so a blind retry would duplicate them.
+
+Keeping bytes on the wire also stops intermediaries idling out a long request,
+which partially mitigates the fragility described in
+[docs/DESIGN.md](../../docs/DESIGN.md) §4.3.
+
 ```bash
 # normal ingest
 curl -sS -X POST http://localhost:8080/ingest \

@@ -3,16 +3,23 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
+	"time"
 
 	icsv "github.com/avimehenwal/secops-telemetry-ingestion/apps/telemetryingestor/internal/csv"
 	"github.com/avimehenwal/secops-telemetry-ingestion/apps/telemetryingestor/internal/filter"
 )
+
+const ndjsonContentType = "application/x-ndjson"
+
+var errStreamTruncated = errors.New("progress stream ended before the final result")
 
 type ingestRecord struct {
 	ID       int64  `json:"id,omitempty"`
@@ -25,10 +32,9 @@ type ingestRequest struct {
 	Records []ingestRecord `json:"records"`
 }
 
-// ingestResult mirrors the processor's response body. A 2xx only means the
-// request was accepted; the body says how many records actually reached the
-// Analytics Service, so the CLI reports that rather than assuming success.
 type ingestResult struct {
+	Type string `json:"type"`
+
 	Received         int `json:"received"`
 	Enriched         int `json:"enriched"`
 	Ingested         int `json:"ingested"`
@@ -130,7 +136,9 @@ func runIngest(args []string) int {
 	fmt.Printf("  timeout:    %s\n\n", resolvedTimeout)
 	fmt.Println("  sending...")
 
-	res, err := postRecords(&http.Client{Timeout: resolvedTimeout}, resolvedEndpoint, records)
+	start := time.Now()
+	res, err := postRecords(&http.Client{Timeout: resolvedTimeout}, resolvedEndpoint, records,
+		func(ev ingestResult) { fmt.Println(progressLine(start, len(records), ev)) })
 	switch {
 	case err == nil && !res.accounted:
 		stats.accepted = len(records)
@@ -143,12 +151,12 @@ func runIngest(args []string) int {
 		stats.droppedEnrichment = res.FailedEnrichment
 		stats.droppedAnalytics = res.FailedAnalytics
 		fmt.Println("  done")
-	case isTimeout(err):
+	case isTimeout(err) || errors.Is(err, errStreamTruncated):
 		// The processor may well have finished the work after we hung up:
 		// calling this "failed" would be a lie, and a blind retry would
 		// duplicate records upstream.
 		stats.unknown = len(records)
-		fmt.Fprintf(os.Stderr, "  timed out (outcome unknown): %v\n", err)
+		fmt.Fprintf(os.Stderr, "  outcome unknown: %v\n", err)
 	default:
 		stats.failed = len(records)
 		fmt.Fprintf(os.Stderr, "  failed: %v\n", err)
@@ -219,7 +227,7 @@ func toIngestRecord(r icsv.Record) (ingestRecord, bool) {
 	}, true
 }
 
-func postRecords(client *http.Client, endpoint string, records []ingestRecord) (ingestResult, error) {
+func postRecords(client *http.Client, endpoint string, records []ingestRecord, onProgress func(ingestResult)) (ingestResult, error) {
 	body, err := json.Marshal(ingestRequest{Records: records})
 	if err != nil {
 		return ingestResult{}, fmt.Errorf("marshalling request: %w", err)
@@ -229,6 +237,7 @@ func postRecords(client *http.Client, endpoint string, records []ingestRecord) (
 		return ingestResult{}, fmt.Errorf("building request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", ndjsonContentType+", application/json")
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -241,6 +250,10 @@ func postRecords(client *http.Client, endpoint string, records []ingestRecord) (
 		return ingestResult{}, fmt.Errorf("processor returned %s: %s", resp.Status, bytes.TrimSpace(snippet))
 	}
 
+	if strings.Contains(resp.Header.Get("Content-Type"), ndjsonContentType) {
+		return readProgressStream(resp.Body, onProgress)
+	}
+
 	var res ingestResult
 	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
 		// Accepted, but we cannot say what happened to the individual records.
@@ -248,6 +261,61 @@ func postRecords(client *http.Client, endpoint string, records []ingestRecord) (
 	}
 	res.accounted = true
 	return res, nil
+}
+
+func readProgressStream(body io.Reader, onProgress func(ingestResult)) (ingestResult, error) {
+	dec := json.NewDecoder(body)
+
+	var final ingestResult
+	for {
+		var ev ingestResult
+		err := dec.Decode(&ev)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return ingestResult{}, fmt.Errorf("%w: %v", errStreamTruncated, err)
+		}
+
+		switch ev.Type {
+		case "result":
+			ev.accounted = true
+			final = ev
+		case "progress":
+			if onProgress != nil {
+				onProgress(ev)
+			}
+		}
+	}
+
+	if !final.accounted {
+		return ingestResult{}, errStreamTruncated
+	}
+	return final, nil
+}
+
+func progressLine(start time.Time, total int, ev ingestResult) string {
+	elapsed := time.Since(start)
+	width := len(strconv.Itoa(total))
+
+	var pct float64
+	if total > 0 {
+		pct = float64(ev.Ingested) / float64(total) * 100
+	}
+
+	// Extrapolating from the observed rate self-corrects; the up-front estimate
+	// assumes perfectly full batches, which a lossy run never achieves.
+	eta := estimateDuration(total) - elapsed
+	if ev.Ingested > 0 {
+		eta = (elapsed / time.Duration(ev.Ingested)) * time.Duration(total-ev.Ingested)
+	}
+	if eta < 0 {
+		eta = 0
+	}
+
+	return fmt.Sprintf("  [%*d/%d] %5.1f%% | enriched %d | elapsed %s | eta %s",
+		width, ev.Ingested, total, pct, ev.Enriched,
+		elapsed.Round(estimateRounding), eta.Round(estimateRounding))
 }
 
 type ingestStats struct {
