@@ -148,6 +148,9 @@ process fails fast at startup on a malformed value.
 | Env var                        | Default                               | Description                                                 |
 | ------------------------------ | ------------------------------------- | ----------------------------------------------------------- |
 | `PROCESSOR_ADDR`               | `:8080`                               | Listen address.                                             |
+| `APP_ENV`                      | `development`                        | Deployment environment; also picks the default log format (see [Logging](#logging)). |
+| `LOG_LEVEL`                    | `info`                                | `debug`, `info`, `warn`, or `error`.                        |
+| `LOG_FORMAT`                   | derived from `APP_ENV`               | `pretty` (colorized console) or `json` (structured); overrides the `APP_ENV`-derived default. |
 | `ENRICHMENT_URL`               | `https://api.heyering.com/enrichment` | Enrichment Service endpoint.                                |
 | `ANALYTICS_URL`                | `https://api.heyering.com/analytics`  | Analytics Service endpoint.                                 |
 | `EYE_API_KEY`                  | `eye-am-hiring`                       | `Authorization` header sent to both services.               |
@@ -179,6 +182,27 @@ ANALYTICS_RATE_REQUESTS=50 ANALYTICS_RATE_WINDOW=1s \
 
 The server shuts down gracefully on `SIGINT`/`SIGTERM`, draining in-flight
 ingests (which can be slow under the Analytics rate limit) for up to 30 s.
+
+## Logging
+
+Every log line carries `service`, `environment`, and a `component` — one of
+`app`, `upstream.enrichment`, or `upstream.analytics` — so the enrichment and
+analytics clients' retry/circuit-breaker chatter is easy to filter from the
+handler's own request logs.
+
+Output comes in two formats, chosen by `LOG_FORMAT` (or, if unset, derived
+from `APP_ENV`):
+
+- **`json`** — one `slog`-structured JSON object per line, timestamped in UTC.
+  The default for anything not `local`/`dev`/`development`.
+- **`pretty`** — colorized, human-scannable console output (via
+  [charmbracelet/log](https://github.com/charmbracelet/log)) prefixed with
+  `[environment][service][package][method]`. The default for local
+  development.
+
+```bash
+LOG_FORMAT=json LOG_LEVEL=debug go run ./apps/telemetryprocessor/cmd/server
+```
 
 ## Throughput note (rate limit ↔ CLI)
 

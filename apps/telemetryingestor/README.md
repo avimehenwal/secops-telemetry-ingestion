@@ -17,7 +17,7 @@ go run ./apps/telemetryingestor <command> [flags]
 The CLI is organised into subcommands:
 
 ```bash
-telemetryingestor ingest   -file <path> [-endpoint <url>] [-timeout <dur>] [-where <expr>] [-dry-run]
+telemetryingestor ingest   -file <path> [-endpoint <url>] [-timeout <dur>] [-where <expr>] [-dry-run] [-skip-preflight]
 telemetryingestor validate -file <path> [-quiet]
 telemetryingestor filter   -file <path> -where <expr> [-where <expr> ...]
 telemetryingestor help
@@ -42,6 +42,7 @@ worse. See [Throughput](#throughput).
 | `-timeout`    | `EYESECURITY_TIMEOUT`    | derived from the record count  | HTTP timeout. The default allows for the Analytics rate limit. |
 | `-where`      | —                        | none                           | Filter expression (repeatable, ANDed). See below. |
 | `-dry-run`    | —                        | `false`                        | Parse and filter but send nothing.                |
+| `-skip-preflight` | —                    | `false`                        | Skip the health check against the processor before sending. |
 
 ```bash
 # ingest everything on the default endpoint
@@ -81,6 +82,30 @@ Summary:
   ingested:             196
 ```
 
+### Preflight check
+
+Before sending (and unless `-dry-run` or `-skip-preflight` is set), `ingest`
+`GET`s the processor's `/health` endpoint, derived from `-endpoint` by
+replacing the trailing `/ingest` path. This turns "processor is down" or
+"wrong `-endpoint`" into an immediate, actionable error instead of a hung
+request that eventually times out:
+
+```
+error: processor pre-check failed for http://localhost:8080/health: dial tcp ...
+
+Nothing is listening at http://localhost:8080/ingest. Start the processor, for example:
+
+  go run ./apps/telemetryprocessor/cmd/server
+
+then re-run this command. Use -endpoint or EYESECURITY_ENDPOINT to point at a different
+instance, or -dry-run to parse the CSV without sending anything.
+```
+
+The hint is tailored to the failure: a DNS error points at `-endpoint`/
+`EYESECURITY_ENDPOINT`, a timeout suggests `-skip-preflight` (the processor
+may just be slow to start), and a reachable-but-unhealthy response points at
+the processor's own logs and its Enrichment/Analytics dependencies.
+
 ### Progress reporting
 
 A large ingest is one long request — 998 records take about 8 minutes — so the
@@ -113,6 +138,20 @@ the processor may well have completed the work after the CLI hung up, so
 calling it a failure would be wrong and a blind retry would duplicate records
 upstream. Re-run deliberately, with a longer `-timeout`.
 
+### Interrupting a run (Ctrl-C)
+
+`SIGINT`/`SIGTERM` are caught rather than killing the process outright. Where
+that lands depends on how far the run got:
+
+- **Before anything was sent** (still reading/filtering the CSV): the CLI
+  prints `interrupted before sending; nothing was ingested` and exits `1`. No
+  network request was made, so there is nothing to reconcile.
+- **Mid-send**: the counts shown are the last ones the processor confirmed,
+  reported as `outcome unknown` and flagged `interrupted` in the summary —
+  a few records already queued upstream (in the processor's batcher) may
+  still land after the CLI exits. As with a timeout, re-running will
+  duplicate whatever did land.
+
 ### Throughput
 
 The Analytics Service allows 1 request of ≤ 20 items per 10 s, so the pipeline
@@ -140,8 +179,9 @@ severity:
 
 - **error** (blocks ingestion, exits non-zero): missing/non-integer `id`,
   missing/invalid `ip`, missing `asset_name`, wrong number of fields on a row.
-- **warning** (advisory, does not block): empty `category`, `null`/empty
-  `source`, unparseable `created_utc`.
+- **warning** (advisory, does not block): empty or unrecognised `category`
+  (the latter flagged explicitly as "the processor will drop this record"),
+  duplicate `id`, `null`/empty `source`, unparseable `created_utc`.
 
 ```bash
 telemetryingestor validate -file docs/example_data_2.csv
