@@ -34,15 +34,15 @@ type Bucket struct {
 	clk        clock
 }
 
-func New(rate int, window time.Duration) *Bucket {
-	return newWithClock(rate, window, clock{now: time.Now, sleep: realSleep})
+func New(requestsPerWindow int, window time.Duration) *Bucket {
+	return newWithClock(requestsPerWindow, window, clock{now: time.Now, sleep: realSleep})
 }
 
-func newWithClock(rate int, window time.Duration, clk clock) *Bucket {
+func newWithClock(requestsPerWindow int, window time.Duration, clk clock) *Bucket {
 	return &Bucket{
-		capacity:   float64(rate),
-		refillRate: float64(rate) / window.Seconds(),
-		tokens:     float64(rate),
+		capacity:   float64(requestsPerWindow),
+		refillRate: float64(requestsPerWindow) / window.Seconds(),
+		tokens:     float64(requestsPerWindow),
 		last:       clk.now(),
 		clk:        clk,
 	}

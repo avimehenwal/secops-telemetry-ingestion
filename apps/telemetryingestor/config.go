@@ -8,27 +8,17 @@ import (
 )
 
 const (
-	envEndpoint = "EYESECURITY_ENDPOINT"
-	envTimeout  = "EYESECURITY_TIMEOUT"
-
+	envEndpoint     = "EYESECURITY_ENDPOINT"
+	envTimeout      = "EYESECURITY_TIMEOUT"
 	defaultEndpoint = "http://localhost:8080/ingest"
 
-	// The Analytics Service accepts at most 20 items per request and only one
-	// request per 10s window (docs/openapi.json). That caps the whole pipeline
-	// at 20 records / 10s, which is what the timeout below has to allow for.
-	upstreamBatchSize  = 20
-	upstreamRateWindow = 10 * time.Second
-
-	// Slack covers enrichment (one call per record) plus connection overhead
-	// on top of the rate-limit floor.
-	timeoutSlack = 30 * time.Second
-
-	estimateRounding = time.Second
+	upstreamBatchSize   = 20
+	upstreamRateWindow  = 10 * time.Second
+	timeoutSlack        = 30 * time.Second
+	timeoutSlackPercent = 25
+	estimateRounding    = time.Second
 )
 
-// estimateDuration is how long the upstream rate limit alone will take for n
-// records: the first batch goes out immediately, every later one waits a
-// window.
 func estimateDuration(records int) time.Duration {
 	batches := (records + upstreamBatchSize - 1) / upstreamBatchSize
 	if batches < 1 {
@@ -37,14 +27,9 @@ func estimateDuration(records int) time.Duration {
 	return time.Duration(batches-1) * upstreamRateWindow
 }
 
-/*
-estimateTimeout derives the HTTP timeout from the work being sent. The
-processor cannot answer faster than the Analytics rate limit allows, so a fixed
-timeout either fails every large file or hides a genuinely stuck processor.
-Both are worse than deriving it.
-*/
 func estimateTimeout(records int) time.Duration {
-	return estimateDuration(records) + timeoutSlack
+	floor := estimateDuration(records)
+	return floor + floor*timeoutSlackPercent/100 + timeoutSlack
 }
 
 func resolveTimeout(flagVal time.Duration, flagSet bool, records int) (time.Duration, error) {

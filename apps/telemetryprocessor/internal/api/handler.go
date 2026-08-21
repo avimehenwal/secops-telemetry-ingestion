@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"strings"
@@ -14,11 +15,12 @@ import (
 	"github.com/avimehenwal/secops-telemetry-ingestion/libs/category"
 )
 
-const maxRecordErrors = 100
-
-const progressEvery = 20
-
-const ndjsonContentType = "application/x-ndjson"
+const (
+	maxReportedErrors = 100
+	progressInterval  = 20
+	outcomeBuffer     = progressInterval
+	ndjsonContentType = "application/x-ndjson"
+)
 
 type IngestHandler struct {
 	Enrichment *enrichment.Client
@@ -58,8 +60,8 @@ func (h *IngestHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	result := h.process(r.Context(), req.Records, dryRun, nil)
-	status := statusFor(result, dryRun)
+	result := h.runPipeline(r.Context(), req.Records, dryRun, nil)
+	status := statusFor(result)
 	h.logResult(result)
 	h.logf("response sent: status=%d", status)
 	writeJSON(w, status, result)
@@ -74,110 +76,62 @@ func (h *IngestHandler) serveStream(w http.ResponseWriter, flusher http.Flusher,
 	flusher.Flush()
 
 	enc := json.NewEncoder(w)
-	write := func(ev model.IngestResult) {
+	writeFrame := func(frame model.IngestResult) {
 		// A failed write means the client hung up. The work continues -- the
 		// batcher owns it now -- but there is nobody left to narrate it to.
-		if err := enc.Encode(ev); err != nil {
+		if err := enc.Encode(frame); err != nil {
 			return
 		}
 		flusher.Flush()
 	}
 
-	result := h.process(r.Context(), req.Records, dryRun, write)
-	result.Type = "result"
-	write(result)
+	result := h.runPipeline(r.Context(), req.Records, dryRun, writeFrame)
+	result.Kind = model.KindResult
+	writeFrame(result)
 	h.logResult(result)
 	h.logf("response sent: status=%d streamed=true", http.StatusOK)
 }
 
-// recordEvent is one record's journey as far as the producer could take it:
-// either a failure with the stage that caused it, or a pending Analytics
-// delivery to be awaited.
-type recordEvent struct {
-	id     int64
-	stage  string // "category" | "enrichment"; empty when result is set
-	reason string
-	result <-chan error
+type recordOutcome struct {
+	id       int64
+	stage    model.Stage // set only on failure; empty when delivery is set
+	reason   string
+	delivery <-chan error
 }
 
-func (h *IngestHandler) process(ctx context.Context, records []model.Record, dryRun bool, onProgress func(model.IngestResult)) model.IngestResult {
+func (h *IngestHandler) runPipeline(ctx context.Context, records []model.Record, dryRun bool, onProgress func(model.IngestResult)) model.IngestResult {
 	result := model.IngestResult{Received: len(records), DryRun: dryRun}
 
 	if dryRun {
-		for _, rec := range records {
-			if _, ok := category.Normalize(rec.Category); !ok {
-				result.FailedCategory++
-				h.addErr(&result, rec.ID, "category", "unrecognised category "+quote(rec.Category))
-				continue
-			}
-			result.Ingested++
-		}
-		return result
+		return h.dryRun(result, records)
 	}
 
 	var enrichedAhead atomic.Int64
 
-	events := make(chan recordEvent, progressEvery)
-	go func() {
-		defer close(events)
-		for _, rec := range records {
-			cat, ok := category.Normalize(rec.Category)
-			if !ok {
-				events <- recordEvent{id: rec.ID, stage: "category",
-					reason: "unrecognised category " + quote(rec.Category)}
-				continue
-			}
-
-			details, err := h.Enrichment.Enrich(ctx, model.Logline{
-				ID:       rec.ID,
-				Asset:    rec.Asset,
-				IP:       rec.IP,
-				Category: cat,
-			})
-			if err != nil {
-				if ctx.Err() != nil {
-					h.logf("ingest aborted mid-enrichment: %v", ctx.Err())
-					return
-				}
-				events <- recordEvent{id: rec.ID, stage: "enrichment", reason: err.Error()}
-				continue
-			}
-			enrichedAhead.Add(1)
-
-			events <- recordEvent{id: rec.ID, result: h.Analytics.Submit(ctx, model.AnalyticsEvent{
-				ID:            rec.ID,
-				Asset:         rec.Asset,
-				IP:            rec.IP,
-				Category:      details.Category,
-				ASN:           details.ASN,
-				CorrelationID: details.CorrelationID,
-			})}
-		}
-	}()
+	outcomes := make(chan recordOutcome, outcomeBuffer)
+	go h.produce(ctx, records, outcomes, &enrichedAhead)
 
 	settled := 0
-	for ev := range events {
-		switch {
-		case ev.result == nil:
-			if ev.stage == "category" {
-				result.FailedCategory++
-			} else {
-				result.FailedEnrichment++
-			}
-			h.addErr(&result, ev.id, ev.stage, ev.reason)
-		default:
+	for outcome := range outcomes {
+		if outcome.delivery == nil {
+			h.countFailure(&result, outcome.id, outcome.stage, outcome.reason)
+		} else {
 			result.Enriched++
-			if err := <-ev.result; err != nil {
-				result.FailedAnalytics++
-				h.addErr(&result, ev.id, "analytics", err.Error())
+			if err := <-outcome.delivery; err != nil {
+				h.countFailure(&result, outcome.id, model.StageAnalytics, err.Error())
 			} else {
 				result.Ingested++
 			}
 		}
 
 		settled++
-		if onProgress != nil && settled%progressEvery == 0 {
-			onProgress(progressSnapshot(result, enrichedAhead.Load()))
+		if settled%progressInterval == 0 {
+			h.logf("ingest progress: settled=%d/%d enriched=%d ingested=%d failed=%d",
+				settled, len(records), enrichedAhead.Load(), result.Ingested,
+				result.FailedCategory+result.FailedEnrichment+result.FailedAnalytics)
+			if onProgress != nil {
+				onProgress(progressFrame(result, enrichedAhead.Load()))
+			}
 		}
 	}
 
@@ -187,13 +141,70 @@ func (h *IngestHandler) process(ctx context.Context, records []model.Record, dry
 	return result
 }
 
-// progressSnapshot is a value copy: interim events carry the counts but not the
-// per-record error list, which only grows and belongs on the final result.
-func progressSnapshot(res model.IngestResult, enrichedAhead int64) model.IngestResult {
-	res.Type = "progress"
-	res.RecordErrors = nil
-	res.Enriched = int(enrichedAhead)
-	return res
+func (h *IngestHandler) produce(ctx context.Context, records []model.Record, outcomes chan<- recordOutcome, enrichedAhead *atomic.Int64) {
+	defer close(outcomes)
+
+	for _, rec := range records {
+		normalised, ok := category.Normalize(rec.Category)
+		if !ok {
+			outcomes <- recordOutcome{
+				id:     rec.ID,
+				stage:  model.StageCategory,
+				reason: fmt.Sprintf("unrecognised category %q", rec.Category),
+			}
+			continue
+		}
+
+		details, err := h.Enrichment.Enrich(ctx, rec.Logline(normalised))
+		if err != nil {
+			if ctx.Err() != nil {
+				h.logf("ingest aborted mid-enrichment: %v", ctx.Err())
+				return
+			}
+			outcomes <- recordOutcome{id: rec.ID, stage: model.StageEnrichment, reason: err.Error()}
+			continue
+		}
+		enrichedAhead.Add(1)
+
+		outcomes <- recordOutcome{
+			id:       rec.ID,
+			delivery: h.Analytics.Submit(ctx, rec.AnalyticsEvent(details)),
+		}
+	}
+}
+
+func (h *IngestHandler) dryRun(result model.IngestResult, records []model.Record) model.IngestResult {
+	for _, rec := range records {
+		if _, ok := category.Normalize(rec.Category); !ok {
+			h.countFailure(&result, rec.ID, model.StageCategory,
+				fmt.Sprintf("unrecognised category %q", rec.Category))
+			continue
+		}
+		result.Ingested++
+	}
+	return result
+}
+
+func progressFrame(result model.IngestResult, enrichedAhead int64) model.IngestResult {
+	result.Kind = model.KindProgress
+	result.RecordErrors = nil
+	result.Enriched = int(enrichedAhead)
+	return result
+}
+
+func (h *IngestHandler) countFailure(result *model.IngestResult, id int64, stage model.Stage, reason string) {
+	switch stage {
+	case model.StageCategory:
+		result.FailedCategory++
+	case model.StageEnrichment:
+		result.FailedEnrichment++
+	case model.StageAnalytics:
+		result.FailedAnalytics++
+	}
+	if len(result.RecordErrors) < maxReportedErrors {
+		result.RecordErrors = append(result.RecordErrors,
+			model.RecordError{ID: id, Stage: stage, Reason: reason})
+	}
 }
 
 func (h *IngestHandler) logResult(result model.IngestResult) {
@@ -202,12 +213,11 @@ func (h *IngestHandler) logResult(result model.IngestResult) {
 		result.FailedCategory, result.FailedEnrichment, result.FailedAnalytics)
 }
 
-func statusFor(res model.IngestResult, dryRun bool) int {
-	if dryRun {
+func statusFor(result model.IngestResult) int {
+	if result.DryRun {
 		return http.StatusOK
 	}
-	attempted := res.Received - res.FailedCategory
-	if attempted > 0 && res.Ingested == 0 {
+	if attempted := result.Received - result.FailedCategory; attempted > 0 && result.Ingested == 0 {
 		return http.StatusBadGateway
 	}
 	return http.StatusOK
@@ -218,27 +228,16 @@ func wantsStream(r *http.Request) bool {
 }
 
 func isDryRun(r *http.Request) bool {
-	switch r.URL.Query().Get("dry-run") {
-	case "1", "true", "TRUE", "True", "yes":
+	switch strings.ToLower(r.URL.Query().Get("dry-run")) {
+	case "1", "true", "yes":
 		return true
 	default:
 		return false
 	}
 }
 
-func (h *IngestHandler) addErr(res *model.IngestResult, id int64, stage, reason string) {
-	if len(res.RecordErrors) >= maxRecordErrors {
-		return
-	}
-	res.RecordErrors = append(res.RecordErrors, model.RecordError{ID: id, Stage: stage, Reason: reason})
-}
-
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
-}
-
-func quote(s string) string {
-	return `"` + s + `"`
 }

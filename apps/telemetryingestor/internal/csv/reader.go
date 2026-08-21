@@ -8,10 +8,10 @@ import (
 )
 
 type Reader struct {
-	raw      *csv.Reader
-	header   []string
-	haveHead bool
-	line     int // number of physical records consumed so far
+	raw        *csv.Reader
+	header     []string
+	headerRead bool
+	line       int // number of physical records consumed so far
 }
 
 func NewReader(src io.Reader) *Reader {
@@ -19,11 +19,12 @@ func NewReader(src io.Reader) *Reader {
 	cr.Comma = ';'
 	cr.FieldsPerRecord = -1
 	cr.TrimLeadingSpace = true
+	cr.LazyQuotes = true
 	return &Reader{raw: cr}
 }
 
 func (r *Reader) ReadHeader() ([]string, error) {
-	if r.haveHead {
+	if r.headerRead {
 		return r.header, nil
 	}
 	row, err := r.raw.Read()
@@ -34,7 +35,7 @@ func (r *Reader) ReadHeader() ([]string, error) {
 		return nil, fmt.Errorf("reading header: %w", err)
 	}
 	r.line++
-	r.haveHead = true
+	r.headerRead = true
 	r.header = row
 
 	if !headerMatches(row) {
@@ -44,7 +45,7 @@ func (r *Reader) ReadHeader() ([]string, error) {
 }
 
 func (r *Reader) Next() (Record, error) {
-	if !r.haveHead {
+	if !r.headerRead {
 		if _, err := r.ReadHeader(); err != nil {
 			return Record{}, err
 		}

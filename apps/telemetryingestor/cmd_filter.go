@@ -2,6 +2,7 @@ package main
 
 import (
 	stdcsv "encoding/csv"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -29,7 +30,7 @@ func runFilter(args []string) int {
 		return 2
 	}
 
-	flt, err := filter.Parse(where)
+	rowFilter, err := filter.Parse(where)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		return 2
@@ -60,7 +61,8 @@ func runFilter(args []string) int {
 		}
 		// Tolerate malformed rows: skip arity errors, abort on real read errors.
 		if err != nil {
-			if _, ok := err.(*icsv.FieldCountError); ok {
+			var fieldCount *icsv.FieldCountError
+			if errors.As(err, &fieldCount) {
 				continue
 			}
 			w.Flush()
@@ -68,7 +70,7 @@ func runFilter(args []string) int {
 			return 1
 		}
 		total++
-		if flt.Match(rec) {
+		if rowFilter.Match(rec) {
 			matched++
 			_ = w.Write([]string{rec.ID, rec.Asset, rec.IP, rec.CreatedUTC, rec.Source, rec.Category})
 		}

@@ -1,6 +1,7 @@
 package validate
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -49,7 +50,6 @@ type Report struct {
 	Warnings int
 }
 
-// OK reports whether the file is free of blocking errors.
 func (r Report) OK() bool { return r.Errors == 0 }
 
 func (r *Report) add(i Issue) {
@@ -74,14 +74,11 @@ func Run(src io.Reader) (Report, error) {
 		if err == io.EOF {
 			break
 		}
-		var fce *csv.FieldCountError
 		if err != nil {
-			if !asFieldCount(err, &fce) {
+			var fce *csv.FieldCountError
+			if !errors.As(err, &fce) {
 				return rep, err
 			}
-			// The reader pads a short row, so the per-column checks below would
-			// report the padding as missing data. The field count is the one
-			// real defect here; report it alone.
 			rep.Rows++
 			rep.add(Issue{Line: fce.Line, Severity: SeverityError, Message: fce.Error()})
 			continue
@@ -93,8 +90,6 @@ func Run(src io.Reader) (Report, error) {
 	return rep, nil
 }
 
-// checkDuplicateID flags a repeated id: the API documents it as a unique
-// identifier, so a repeat means either a broken export or a double ingest.
 func checkDuplicateID(rep *Report, r csv.Record, seen map[string]int) {
 	if r.ID == "" {
 		return
@@ -142,12 +137,4 @@ func checkRecord(rep *Report, r csv.Record) {
 			rep.add(Issue{Line: r.Line, Column: csv.ColCreatedUTC, Severity: SeverityWarning, Message: fmt.Sprintf("unparseable timestamp %q (want %q)", r.CreatedUTC, dateLayout)})
 		}
 	}
-}
-
-func asFieldCount(err error, target **csv.FieldCountError) bool {
-	fce, ok := err.(*csv.FieldCountError)
-	if ok {
-		*target = fce
-	}
-	return ok
 }

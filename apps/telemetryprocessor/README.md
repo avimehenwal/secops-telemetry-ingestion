@@ -128,7 +128,7 @@ For each record:
   request costs a whole window however full it is, the batch size *is* the
   throughput — so a single process-wide **`analytics.Batcher`** collects
   records from every in-flight ingest request and emits full 20-item batches.
-  A partial batch is flushed after `ANALYTICS_BATCH_DELAY` rather than being
+  A partial batch is flushed after `ANALYTICS_MAX_FILL_WAIT` rather than being
   stranded. Every *request* — including 429 retries — is gated through a
   **shared token-bucket limiter**. `429` responses are retried, honouring
   `Retry-After` (the live service returns `Retry-After: 10`).
@@ -145,26 +145,26 @@ For each record:
 Everything is overridable from environment variables (env var > default). The
 process fails fast at startup on a malformed value.
 
-| Env var                       | Default                                | Description                                        |
-| ----------------------------- | -------------------------------------- | -------------------------------------------------- |
-| `PROCESSOR_ADDR`              | `:8080`                                | Listen address.                                    |
-| `ENRICHMENT_URL`              | `https://api.heyering.com/enrichment`  | Enrichment Service endpoint.                       |
-| `ANALYTICS_URL`               | `https://api.heyering.com/analytics`   | Analytics Service endpoint.                        |
-| `EYE_API_KEY`                 | `eye-am-hiring`                        | `Authorization` header sent to both services.      |
-| `ENRICHMENT_TIMEOUT`          | `10s`                                  | Per-attempt HTTP timeout.                          |
-| `ENRICHMENT_MAX_ATTEMPTS`     | `4`                                    | Total attempts (1 = no retry).                     |
-| `ENRICHMENT_BACKOFF_BASE`     | `200ms`                                | First retry delay, doubled each attempt.           |
-| `ENRICHMENT_BACKOFF_MAX`      | `5s`                                   | Cap on a single backoff sleep.                     |
-| `ENRICHMENT_BREAKER_TRIP`     | `5`                                    | Consecutive failures before the breaker opens (0 disables). |
-| `ENRICHMENT_BREAKER_COOLDOWN` | `15s`                                  | How long the breaker stays open.                   |
-| `ANALYTICS_TIMEOUT`           | `10s`                                  | Per-attempt HTTP timeout.                          |
-| `ANALYTICS_BATCH_SIZE`        | `20`                                   | Events per upstream request (1–20).                |
-| `ANALYTICS_BATCH_DELAY`       | `2s`                                   | How long a partial batch waits for company.        |
-| `ANALYTICS_QUEUE_SIZE`        | `200`                                  | Events buffered before ingest requests block.      |
-| `ANALYTICS_BATCH_GRACE`       | `30s`                                  | Budget for delivering queued events at shutdown.   |
-| `ANALYTICS_RATE_REQUESTS`     | `1`                                    | Requests permitted per window (upstream allows 1). |
-| `ANALYTICS_RATE_WINDOW`       | `10s`                                  | The rate-limit window.                             |
-| `ANALYTICS_MAX_RETRIES`       | `5`                                    | Retries on HTTP 429.                               |
+| Env var                        | Default                               | Description                                                 |
+| ------------------------------ | ------------------------------------- | ----------------------------------------------------------- |
+| `PROCESSOR_ADDR`               | `:8080`                               | Listen address.                                             |
+| `ENRICHMENT_URL`               | `https://api.heyering.com/enrichment` | Enrichment Service endpoint.                                |
+| `ANALYTICS_URL`                | `https://api.heyering.com/analytics`  | Analytics Service endpoint.                                 |
+| `EYE_API_KEY`                  | `eye-am-hiring`                       | `Authorization` header sent to both services.               |
+| `ENRICHMENT_TIMEOUT`           | `10s`                                 | Per-attempt HTTP timeout.                                   |
+| `ENRICHMENT_MAX_ATTEMPTS`      | `4`                                   | Total attempts (1 = no retry).                              |
+| `ENRICHMENT_BACKOFF_BASE`      | `200ms`                               | First retry delay, doubled each attempt.                    |
+| `ENRICHMENT_BACKOFF_MAX`       | `5s`                                  | Cap on a single backoff sleep.                              |
+| `ENRICHMENT_BREAKER_THRESHOLD` | `5`                                   | Consecutive failures before the breaker opens (0 disables). |
+| `ENRICHMENT_BREAKER_COOLDOWN`  | `15s`                                 | How long the breaker stays open.                            |
+| `ANALYTICS_TIMEOUT`            | `10s`                                 | Per-attempt HTTP timeout.                                   |
+| `ANALYTICS_BATCH_SIZE`         | `20`                                  | Events per upstream request (1–20).                         |
+| `ANALYTICS_MAX_FILL_WAIT`      | `8s`                                  | How long a partial batch waits for company.                 |
+| `ANALYTICS_QUEUE_SIZE`         | `200`                                 | Events buffered before ingest requests block.               |
+| `ANALYTICS_DRAIN_GRACE`        | `30s`                                 | Budget for delivering queued events at shutdown.            |
+| `ANALYTICS_RATE_REQUESTS`      | `1`                                   | Requests permitted per window (upstream allows 1).          |
+| `ANALYTICS_RATE_WINDOW`        | `10s`                                 | The rate-limit window.                                      |
+| `ANALYTICS_MAX_RETRIES`        | `5`                                   | Retries on HTTP 429.                                        |
 
 ```bash
 mise run run-processor          # or: go run ./apps/telemetryprocessor/cmd/server

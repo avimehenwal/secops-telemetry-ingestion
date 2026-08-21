@@ -36,15 +36,10 @@ func (p predicate) match(r csv.Record) bool {
 	}
 }
 
-/*
-Filter is a conjunction (AND) of predicates. The zero value matches every
-record, which is the natural "no filter supplied" behaviour.
-*/
 type Filter struct {
 	preds []predicate
 }
 
-// Empty reports whether the filter has no predicates (matches everything).
 func (f Filter) Empty() bool { return len(f.preds) == 0 }
 
 func (f Filter) Match(r csv.Record) bool {
@@ -56,18 +51,13 @@ func (f Filter) Match(r csv.Record) bool {
 	return true
 }
 
-/*
-Parse builds a Filter from expressions of the form "column=value" or
-"column~value". Unknown columns are rejected up front so the user gets a
-clear error instead of a filter that silently matches nothing.
-*/
 func Parse(exprs []string) (Filter, error) {
 	var f Filter
 	for _, expr := range exprs {
 		if strings.TrimSpace(expr) == "" {
 			continue
 		}
-		p, err := parseOne(expr)
+		p, err := parsePredicate(expr)
 		if err != nil {
 			return Filter{}, err
 		}
@@ -80,7 +70,7 @@ func Parse(exprs []string) (Filter, error) {
 	return f, nil
 }
 
-func parseOne(expr string) (predicate, error) {
+func parsePredicate(expr string) (predicate, error) {
 	/*
 		'~' is checked before '=' only matters if both appear; we split on the
 		first operator character encountered so values may contain the other.

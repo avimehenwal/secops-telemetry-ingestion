@@ -3,151 +3,160 @@ package analytics
 import (
 	"context"
 	"fmt"
+	"log"
 	"time"
 
 	"github.com/avimehenwal/secops-telemetry-ingestion/apps/telemetryprocessor/internal/model"
 )
 
+const defaultMaxFillWait = 8 * time.Second
+
 type Batcher struct {
-	in        chan submission
-	batchSize int
-	maxDelay  time.Duration
-	grace     time.Duration
-	send      func(context.Context, []model.AnalyticsEvent) (int, error)
-	done      chan struct{}
+	queue       chan submission
+	batchSize   int
+	maxFillWait time.Duration
+	drainGrace  time.Duration
+	sendBatch   func(context.Context, []model.AnalyticsEvent) (int, error)
+	stopped     chan struct{}
+	logger      *log.Logger
 }
 
+// submission is one event plus the channel its submitter is waiting on.
 type submission struct {
-	event  model.AnalyticsEvent
-	result chan error
+	event   model.AnalyticsEvent
+	outcome chan error
 }
 
 type BatcherOptions struct {
-	BatchSize int           // events per upstream request (clamped to UpstreamMaxBatchSize)
-	MaxDelay  time.Duration // how long a partial batch waits for company
-	QueueSize int           // events buffered before Submit applies backpressure
-	Grace     time.Duration // budget for delivering what is queued at shutdown
+	BatchSize   int           // events per upstream request (clamped to UpstreamMaxBatchSize)
+	MaxFillWait time.Duration // how long a partial batch waits for company
+	QueueSize   int           // events buffered before Submit applies backpressure
+	DrainGrace  time.Duration // budget for delivering what is queued at shutdown
+	Logger      *log.Logger   // optional; each flush is logged here
 }
 
-func NewBatcher(send func(context.Context, []model.AnalyticsEvent) (int, error), opts BatcherOptions) *Batcher {
+func NewBatcher(sendBatch func(context.Context, []model.AnalyticsEvent) (int, error), opts BatcherOptions) *Batcher {
 	if opts.BatchSize < 1 || opts.BatchSize > UpstreamMaxBatchSize {
 		opts.BatchSize = UpstreamMaxBatchSize
 	}
-	if opts.MaxDelay <= 0 {
-		opts.MaxDelay = 2 * time.Second
+	if opts.MaxFillWait <= 0 {
+		opts.MaxFillWait = defaultMaxFillWait
 	}
 	if opts.QueueSize < 1 {
 		opts.QueueSize = opts.BatchSize * 4
 	}
-	if opts.Grace <= 0 {
-		opts.Grace = 30 * time.Second
+	if opts.DrainGrace <= 0 {
+		opts.DrainGrace = 30 * time.Second
 	}
 	return &Batcher{
-		in:        make(chan submission, opts.QueueSize),
-		batchSize: opts.BatchSize,
-		maxDelay:  opts.MaxDelay,
-		grace:     opts.Grace,
-		send:      send,
-		done:      make(chan struct{}),
+		queue:       make(chan submission, opts.QueueSize),
+		batchSize:   opts.BatchSize,
+		maxFillWait: opts.MaxFillWait,
+		drainGrace:  opts.DrainGrace,
+		sendBatch:   sendBatch,
+		stopped:     make(chan struct{}),
+		logger:      opts.Logger,
 	}
 }
 
-func (b *Batcher) Submit(ctx context.Context, ev model.AnalyticsEvent) <-chan error {
-	result := make(chan error, 1)
-	select {
-	case b.in <- submission{event: ev, result: result}:
-	case <-ctx.Done():
-		result <- ctx.Err()
-		close(result)
+func (b *Batcher) logf(format string, args ...any) {
+	if b.logger != nil {
+		b.logger.Printf(format, args...)
 	}
-	return result
+}
+
+func (b *Batcher) Submit(ctx context.Context, event model.AnalyticsEvent) <-chan error {
+	outcome := make(chan error, 1)
+	select {
+	case b.queue <- submission{event: event, outcome: outcome}:
+	case <-ctx.Done():
+		outcome <- ctx.Err()
+		close(outcome)
+	}
+	return outcome
 }
 
 func (b *Batcher) Run(ctx context.Context) {
-	defer close(b.done)
+	defer close(b.stopped)
 
-	pending := make([]submission, 0, b.batchSize)
-	var idle <-chan time.Time
+	batch := make([]submission, 0, b.batchSize)
+	var fillDeadline <-chan time.Time
 
 	for {
 		select {
 		case <-ctx.Done():
-			b.shutdown(ctx, pending)
+			b.drain(ctx, batch)
 			return
 
-		case s := <-b.in:
-			pending = append(pending, s)
-			if len(pending) < b.batchSize {
-				if idle == nil {
-					idle = time.After(b.maxDelay)
+		case s := <-b.queue:
+			batch = append(batch, s)
+			if len(batch) < b.batchSize {
+				if fillDeadline == nil {
+					fillDeadline = time.After(b.maxFillWait)
 				}
 				continue
 			}
-			b.flush(ctx, pending)
-			pending, idle = pending[:0], nil
+			b.flush(ctx, batch)
+			batch, fillDeadline = batch[:0], nil
 
-		case <-idle:
+		case <-fillDeadline:
 			// Nobody else is coming: send a short batch rather than strand it.
-			b.flush(ctx, pending)
-			pending, idle = pending[:0], nil
+			b.flush(ctx, batch)
+			batch, fillDeadline = batch[:0], nil
 		}
 	}
 }
 
-func (b *Batcher) Wait() { <-b.done }
+func (b *Batcher) Wait() { <-b.stopped }
 
-func (b *Batcher) shutdown(ctx context.Context, pending []submission) {
+func (b *Batcher) drain(ctx context.Context, batch []submission) {
 	for drained := false; !drained; {
 		select {
-		case s := <-b.in:
-			pending = append(pending, s)
+		case s := <-b.queue:
+			batch = append(batch, s)
 		default:
 			drained = true
 		}
 	}
 
-	graceCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), b.grace)
+	graceCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), b.drainGrace)
 	defer cancel()
 
-	for len(pending) > b.batchSize {
-		b.flush(graceCtx, pending[:b.batchSize])
-		pending = pending[b.batchSize:]
+	for len(batch) > b.batchSize {
+		b.flush(graceCtx, batch[:b.batchSize])
+		batch = batch[b.batchSize:]
 	}
-	b.flush(graceCtx, pending)
+	b.flush(graceCtx, batch)
 }
 
-func (b *Batcher) flush(ctx context.Context, pending []submission) {
-	if len(pending) == 0 {
+func (b *Batcher) flush(ctx context.Context, batch []submission) {
+	if len(batch) == 0 {
 		return
 	}
 
-	events := make([]model.AnalyticsEvent, len(pending))
-	for i, s := range pending {
+	events := make([]model.AnalyticsEvent, len(batch))
+	for i, s := range batch {
 		events[i] = s.event
 	}
 
-	ingested, err := b.send(ctx, events)
-
-	/*
-		A 200 is not a receipt. The Analytics Service answers with a count
-		(itemsIngested), and that count is allowed to be lower than what we
-		sent. Treating a short count as success is how a mission-critical
-		pipeline quietly loses records, so the shortfall becomes an error.
-
-		The service reports *how many* landed, never *which*, so attributing
-		the shortfall to the tail of the batch is a convention, not a fact. It
-		is the count that reaches the operator, and the count is right.
-	*/
-	if err == nil && ingested < len(pending) {
-		err = fmt.Errorf("analytics accepted only %d of %d events", ingested, len(pending))
+	start := time.Now()
+	ingested, err := b.sendBatch(ctx, events)
+	if err != nil {
+		b.logf("analytics batch sent: size=%d ingested=%d duration=%s error=%v", len(batch), ingested, time.Since(start), err)
+	} else {
+		b.logf("analytics batch sent: size=%d ingested=%d duration=%s", len(batch), ingested, time.Since(start))
 	}
 
-	for i, s := range pending {
+	if err == nil && ingested < len(batch) {
+		err = fmt.Errorf("analytics accepted only %d of %d events", ingested, len(batch))
+	}
+
+	for i, s := range batch {
 		if err != nil && i >= ingested {
-			s.result <- err
+			s.outcome <- err
 		} else {
-			s.result <- nil
+			s.outcome <- nil
 		}
-		close(s.result)
+		close(s.outcome)
 	}
 }

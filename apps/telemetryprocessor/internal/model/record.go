@@ -7,6 +7,21 @@ type Record struct {
 	Category string `json:"category"`
 }
 
+func (r Record) Logline(normalisedCategory string) Logline {
+	return Logline{ID: r.ID, Asset: r.Asset, IP: r.IP, Category: normalisedCategory}
+}
+
+func (r Record) AnalyticsEvent(details EnrichmentDetails) AnalyticsEvent {
+	return AnalyticsEvent{
+		ID:            r.ID,
+		Asset:         r.Asset,
+		IP:            r.IP,
+		Category:      details.Category,
+		ASN:           details.ASN,
+		CorrelationID: details.CorrelationID,
+	}
+}
+
 type IngestRequest struct {
 	Records []Record `json:"records"`
 }
@@ -38,8 +53,23 @@ type AnalyticsSuccessResponse struct {
 	ItemsIngested int64  `json:"itemsIngested"`
 }
 
+type Stage string
+
+const (
+	StageCategory   Stage = "category"   // free text we could not map to the enum
+	StageEnrichment Stage = "enrichment" // the Enrichment Service would not enrich it
+	StageAnalytics  Stage = "analytics"  // enriched, but it did not land upstream
+)
+
+type EventKind string
+
+const (
+	KindProgress EventKind = "progress"
+	KindResult   EventKind = "result"
+)
+
 type IngestResult struct {
-	Type string `json:"type,omitempty"`
+	Kind EventKind `json:"type,omitempty"`
 
 	Received         int           `json:"received"`
 	Enriched         int           `json:"enriched"`
@@ -54,6 +84,6 @@ type IngestResult struct {
 
 type RecordError struct {
 	ID     int64  `json:"id,omitempty"`
-	Stage  string `json:"stage"` // "category" | "enrichment" | "analytics"
+	Stage  Stage  `json:"stage"`
 	Reason string `json:"reason"`
 }

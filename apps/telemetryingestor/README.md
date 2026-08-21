@@ -64,7 +64,7 @@ Ingesting docs/example_data_2.csv
   processor:  reachable and healthy
   records:    196
   estimated:  1m30s at 20 records / 10s (upstream rate limit)
-  timeout:    2m0s
+  timeout:    2m22.5s
 
   sending...
   [ 20/196]  10.2% | enriched 36 | elapsed 12s | eta 1m45s
@@ -121,9 +121,17 @@ file. Nothing client-side changes that number, which is why the CLI does not
 try: it sends everything in one request and lets the processor's shared batcher
 keep every upstream batch full.
 
-`-timeout` therefore defaults to `(ceil(records/20) - 1) × 10s + 30s`, so a run
-is never cancelled merely for waiting its turn. The CLI prints the estimate
-before it starts.
+`-timeout` therefore defaults to `floor + 25% + 30s`, where
+`floor = (ceil(records/20) - 1) × 10s`, so a run is never cancelled merely for
+waiting its turn. The CLI prints the estimate before it starts.
+
+The proportional part matters: `floor` assumes *perfectly full* batches, and a
+real run does not manage that. One enrichment retry ladder can stall a batch
+past the batcher's flush delay, and every short batch costs another whole
+window. With a flat 30 s — 6% of an 8-minute run — a handful of short batches
+made the CLI hang up on a run that was about to succeed and report `outcome
+unknown`, which is precisely the state that invites a duplicate-producing
+re-run.
 
 ### `validate`
 

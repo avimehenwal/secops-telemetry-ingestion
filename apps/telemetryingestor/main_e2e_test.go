@@ -427,8 +427,10 @@ func TestHealthURLDerivation(t *testing.T) {
 	}
 }
 
-// The timeout must leave room for the rate-limit window every batch beyond the
-// first has to wait through. A fixed timeout is what made large runs fail.
+func withSlack(floor time.Duration) time.Duration {
+	return floor + floor*timeoutSlackPercent/100 + timeoutSlack
+}
+
 func TestEstimateTimeoutTracksRecordCount(t *testing.T) {
 	tests := []struct {
 		records int
@@ -436,9 +438,9 @@ func TestEstimateTimeoutTracksRecordCount(t *testing.T) {
 	}{
 		{1, timeoutSlack},
 		{20, timeoutSlack},
-		{21, upstreamRateWindow + timeoutSlack},
-		{100, 4*upstreamRateWindow + timeoutSlack},
-		{999, 49*upstreamRateWindow + timeoutSlack},
+		{21, withSlack(upstreamRateWindow)},
+		{100, withSlack(4 * upstreamRateWindow)},
+		{999, withSlack(49 * upstreamRateWindow)},
 	}
 	for _, tc := range tests {
 		if got := estimateTimeout(tc.records); got != tc.want {

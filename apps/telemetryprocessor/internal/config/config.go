@@ -13,21 +13,21 @@ type Config struct {
 	AnalyticsURL  string
 	APIKey        string
 
-	EnrichmentTimeout         time.Duration // per-attempt HTTP timeout
-	EnrichmentMaxAttempts     int           // total attempts (1 == no retry)
-	EnrichmentBackoffBase     time.Duration // base delay, doubled each retry
-	EnrichmentBackoffMax      time.Duration // cap on a single backoff sleep
-	EnrichmentBreakerTrip     int           // consecutive failures before the breaker opens
-	EnrichmentBreakerCooldown time.Duration // how long the breaker stays open
+	EnrichmentTimeout          time.Duration // per-attempt HTTP timeout
+	EnrichmentMaxAttempts      int           // total attempts (1 == no retry)
+	EnrichmentBackoffBase      time.Duration // base delay, doubled each retry
+	EnrichmentBackoffMax       time.Duration // cap on a single backoff sleep
+	EnrichmentBreakerThreshold int           // consecutive failures before the breaker opens
+	EnrichmentBreakerCooldown  time.Duration // how long the breaker stays open
 
-	AnalyticsTimeout     time.Duration // per-attempt HTTP timeout
-	AnalyticsBatchSize   int           // max events per request (upstream max is 20)
-	AnalyticsBatchDelay  time.Duration // how long a partial batch waits for company
-	AnalyticsQueueSize   int           // events buffered before ingest requests block
-	AnalyticsBatchGrace  time.Duration // budget for delivering queued events at shutdown
-	AnalyticsRateRequest int           // requests permitted per RateWindow (upstream allows 1)
-	AnalyticsRateWindow  time.Duration // the rate-limit window
-	AnalyticsMaxRetries  int           // retries on HTTP 429 before giving up
+	AnalyticsTimeout      time.Duration // per-attempt HTTP timeout
+	AnalyticsBatchSize    int           // max events per request (upstream max is 20)
+	AnalyticsMaxFillWait  time.Duration // how long a partial batch waits for company
+	AnalyticsQueueSize    int           // events buffered before ingest requests block
+	AnalyticsDrainGrace   time.Duration // budget for delivering queued events at shutdown
+	AnalyticsRateRequests int           // requests permitted per RateWindow (upstream allows 1)
+	AnalyticsRateWindow   time.Duration // the rate-limit window
+	AnalyticsMaxRetries   int           // retries on HTTP 429 before giving up
 }
 
 func Load() (Config, error) {
@@ -51,7 +51,7 @@ func Load() (Config, error) {
 	if c.EnrichmentBackoffMax, err = getenvDuration("ENRICHMENT_BACKOFF_MAX", 5*time.Second); err != nil {
 		return Config{}, err
 	}
-	if c.EnrichmentBreakerTrip, err = getenvInt("ENRICHMENT_BREAKER_TRIP", 5); err != nil {
+	if c.EnrichmentBreakerThreshold, err = getenvInt("ENRICHMENT_BREAKER_THRESHOLD", 5); err != nil {
 		return Config{}, err
 	}
 	if c.EnrichmentBreakerCooldown, err = getenvDuration("ENRICHMENT_BREAKER_COOLDOWN", 15*time.Second); err != nil {
@@ -64,16 +64,18 @@ func Load() (Config, error) {
 	if c.AnalyticsBatchSize, err = getenvInt("ANALYTICS_BATCH_SIZE", 20); err != nil {
 		return Config{}, err
 	}
-	if c.AnalyticsBatchDelay, err = getenvDuration("ANALYTICS_BATCH_DELAY", 2*time.Second); err != nil {
+	// Close to the rate window on purpose: a short batch costs a whole window,
+	// so waiting for company is cheaper than latency suggests (see batcher.go).
+	if c.AnalyticsMaxFillWait, err = getenvDuration("ANALYTICS_MAX_FILL_WAIT", 8*time.Second); err != nil {
 		return Config{}, err
 	}
 	if c.AnalyticsQueueSize, err = getenvInt("ANALYTICS_QUEUE_SIZE", 200); err != nil {
 		return Config{}, err
 	}
-	if c.AnalyticsBatchGrace, err = getenvDuration("ANALYTICS_BATCH_GRACE", 30*time.Second); err != nil {
+	if c.AnalyticsDrainGrace, err = getenvDuration("ANALYTICS_DRAIN_GRACE", 30*time.Second); err != nil {
 		return Config{}, err
 	}
-	if c.AnalyticsRateRequest, err = getenvInt("ANALYTICS_RATE_REQUESTS", 1); err != nil {
+	if c.AnalyticsRateRequests, err = getenvInt("ANALYTICS_RATE_REQUESTS", 1); err != nil {
 		return Config{}, err
 	}
 	if c.AnalyticsRateWindow, err = getenvDuration("ANALYTICS_RATE_WINDOW", 10*time.Second); err != nil {
@@ -90,16 +92,16 @@ func (c Config) validate() error {
 	switch {
 	case c.EnrichmentMaxAttempts < 1:
 		return fmt.Errorf("ENRICHMENT_MAX_ATTEMPTS must be >= 1, got %d", c.EnrichmentMaxAttempts)
-	case c.EnrichmentBreakerTrip < 1:
-		return fmt.Errorf("ENRICHMENT_BREAKER_TRIP must be >= 1, got %d", c.EnrichmentBreakerTrip)
+	case c.EnrichmentBreakerThreshold < 1:
+		return fmt.Errorf("ENRICHMENT_BREAKER_THRESHOLD must be >= 1, got %d", c.EnrichmentBreakerThreshold)
 	case c.AnalyticsBatchSize < 1 || c.AnalyticsBatchSize > 20:
 		return fmt.Errorf("ANALYTICS_BATCH_SIZE must be between 1 and 20, got %d", c.AnalyticsBatchSize)
-	case c.AnalyticsBatchDelay <= 0:
-		return fmt.Errorf("ANALYTICS_BATCH_DELAY must be > 0, got %s", c.AnalyticsBatchDelay)
+	case c.AnalyticsMaxFillWait <= 0:
+		return fmt.Errorf("ANALYTICS_MAX_FILL_WAIT must be > 0, got %s", c.AnalyticsMaxFillWait)
 	case c.AnalyticsQueueSize < 1:
 		return fmt.Errorf("ANALYTICS_QUEUE_SIZE must be >= 1, got %d", c.AnalyticsQueueSize)
-	case c.AnalyticsRateRequest < 1:
-		return fmt.Errorf("ANALYTICS_RATE_REQUESTS must be >= 1, got %d", c.AnalyticsRateRequest)
+	case c.AnalyticsRateRequests < 1:
+		return fmt.Errorf("ANALYTICS_RATE_REQUESTS must be >= 1, got %d", c.AnalyticsRateRequests)
 	case c.AnalyticsRateWindow <= 0:
 		return fmt.Errorf("ANALYTICS_RATE_WINDOW must be > 0, got %s", c.AnalyticsRateWindow)
 	// A negative retry budget would skip the send loop entirely and report a

@@ -37,7 +37,7 @@ flowchart TB
         NORM --> ENRICH["enrich: 1 call per record<br/>retry + circuit breaker"]
         ENRICH --> SUBMIT["Batcher.Submit(event)"]
         SUBMIT --> QUEUE[["buffered channel<br/>200 events"]]
-        QUEUE --> BATCHER["batcher goroutine<br/><b>exactly one, process-wide</b><br/>fills batches of 20,<br/>flushes a partial after 2s"]
+        QUEUE --> BATCHER["batcher goroutine<br/><b>exactly one, process-wide</b><br/>fills batches of 20,<br/>flushes a partial after 8s"]
         BATCHER --> LIMIT{{"token bucket<br/>1 request / 10s"}}
         LIMIT --> SEND["POST /analytics<br/>≤ 20 items, retries on 429"]
     end
@@ -110,6 +110,7 @@ mise run run-processor       # runs the microservice on :8080
 mise run dev-processor       # runs the microservice with hot reload (air), see .air.toml
 mise run test                # go test across every module in the workspace
 mise run vet                 # go vet across every module in the workspace
+mise run                     # vet then test — the pre-commit gate
 ```
 
 Without mise, the equivalent plain `go` commands work too, e.g.:

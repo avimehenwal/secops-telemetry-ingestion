@@ -27,16 +27,18 @@ func main() {
 
 	analyticsClient := analytics.NewClient(cfg.AnalyticsURL, cfg.APIKey, analytics.Options{
 		Timeout:      cfg.AnalyticsTimeout,
-		RateRequests: cfg.AnalyticsRateRequest,
+		RateRequests: cfg.AnalyticsRateRequests,
 		RateWindow:   cfg.AnalyticsRateWindow,
 		MaxRetries:   cfg.AnalyticsMaxRetries,
+		Logger:       logger,
 	})
 
 	batcher := analytics.NewBatcher(analyticsClient.SendBatch, analytics.BatcherOptions{
-		BatchSize: cfg.AnalyticsBatchSize,
-		MaxDelay:  cfg.AnalyticsBatchDelay,
-		QueueSize: cfg.AnalyticsQueueSize,
-		Grace:     cfg.AnalyticsBatchGrace,
+		BatchSize:   cfg.AnalyticsBatchSize,
+		MaxFillWait: cfg.AnalyticsMaxFillWait,
+		QueueSize:   cfg.AnalyticsQueueSize,
+		DrainGrace:  cfg.AnalyticsDrainGrace,
+		Logger:      logger,
 	})
 	batcherCtx, stopBatcher := context.WithCancel(context.Background())
 	defer stopBatcher()
@@ -44,12 +46,13 @@ func main() {
 
 	handler := &api.IngestHandler{
 		Enrichment: enrichment.NewClient(cfg.EnrichmentURL, cfg.APIKey, enrichment.Options{
-			Timeout:         cfg.EnrichmentTimeout,
-			MaxAttempts:     cfg.EnrichmentMaxAttempts,
-			BackoffBase:     cfg.EnrichmentBackoffBase,
-			BackoffMax:      cfg.EnrichmentBackoffMax,
-			BreakerTrip:     cfg.EnrichmentBreakerTrip,
-			BreakerCooldown: cfg.EnrichmentBreakerCooldown,
+			Timeout:          cfg.EnrichmentTimeout,
+			MaxAttempts:      cfg.EnrichmentMaxAttempts,
+			BackoffBase:      cfg.EnrichmentBackoffBase,
+			BackoffMax:       cfg.EnrichmentBackoffMax,
+			BreakerThreshold: cfg.EnrichmentBreakerThreshold,
+			BreakerCooldown:  cfg.EnrichmentBreakerCooldown,
+			Logger:           logger,
 		}),
 		Analytics: batcher,
 		Logger:    logger,
@@ -70,7 +73,7 @@ func main() {
 
 	srv := &http.Server{
 		Addr:              cfg.Addr,
-		Handler:           mux,
+		Handler:           api.LoggingMiddleware(logger, mux),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
@@ -79,7 +82,7 @@ func main() {
 
 	go func() {
 		logger.Printf("telemetryprocessor listening on %s (enrichment=%s analytics=%s, rate=%d req/%s, batch=%d)",
-			cfg.Addr, cfg.EnrichmentURL, cfg.AnalyticsURL, cfg.AnalyticsRateRequest, cfg.AnalyticsRateWindow, cfg.AnalyticsBatchSize)
+			cfg.Addr, cfg.EnrichmentURL, cfg.AnalyticsURL, cfg.AnalyticsRateRequests, cfg.AnalyticsRateWindow, cfg.AnalyticsBatchSize)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			logger.Fatalf("server error: %v", err)
 		}

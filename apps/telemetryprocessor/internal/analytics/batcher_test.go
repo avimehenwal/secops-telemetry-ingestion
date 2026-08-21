@@ -47,9 +47,8 @@ func runBatcher(t *testing.T, rec *recorder, opts BatcherOptions) *Batcher {
 
 func TestBatcherCoalescesAcrossCallers(t *testing.T) {
 	rec := &recorder{n: -1}
-	b := runBatcher(t, rec, BatcherOptions{BatchSize: 20, MaxDelay: time.Hour})
+	b := runBatcher(t, rec, BatcherOptions{BatchSize: 20, MaxFillWait: time.Hour})
 
-	// Two "requests" of 10 each: one full batch, not two short ones.
 	var wg sync.WaitGroup
 	for i := 0; i < 2; i++ {
 		wg.Add(1)
@@ -73,9 +72,9 @@ func TestBatcherCoalescesAcrossCallers(t *testing.T) {
 	}
 }
 
-func TestBatcherFlushesPartialBatchAfterMaxDelay(t *testing.T) {
+func TestBatcherFlushesPartialBatchAfterMaxFillWait(t *testing.T) {
 	rec := &recorder{n: -1}
-	b := runBatcher(t, rec, BatcherOptions{BatchSize: 20, MaxDelay: 20 * time.Millisecond})
+	b := runBatcher(t, rec, BatcherOptions{BatchSize: 20, MaxFillWait: 20 * time.Millisecond})
 
 	if err := <-b.Submit(context.Background(), model.AnalyticsEvent{ID: 7}); err != nil {
 		t.Fatal(err)
@@ -87,7 +86,7 @@ func TestBatcherFlushesPartialBatchAfterMaxDelay(t *testing.T) {
 
 func TestBatcherReportsSendFailureToEachWaiter(t *testing.T) {
 	rec := &recorder{n: 0, err: errors.New("analytics down")}
-	b := runBatcher(t, rec, BatcherOptions{BatchSize: 2, MaxDelay: 20 * time.Millisecond})
+	b := runBatcher(t, rec, BatcherOptions{BatchSize: 2, MaxFillWait: 20 * time.Millisecond})
 
 	r1 := b.Submit(context.Background(), model.AnalyticsEvent{ID: 1})
 	r2 := b.Submit(context.Background(), model.AnalyticsEvent{ID: 2})
@@ -101,7 +100,7 @@ func TestBatcherReportsSendFailureToEachWaiter(t *testing.T) {
 
 func TestBatcherAttributesPartialIngest(t *testing.T) {
 	rec := &recorder{n: 1, err: errors.New("truncated")}
-	b := runBatcher(t, rec, BatcherOptions{BatchSize: 2, MaxDelay: time.Hour})
+	b := runBatcher(t, rec, BatcherOptions{BatchSize: 2, MaxFillWait: time.Hour})
 
 	r1 := b.Submit(context.Background(), model.AnalyticsEvent{ID: 1})
 	r2 := b.Submit(context.Background(), model.AnalyticsEvent{ID: 2})
@@ -113,10 +112,9 @@ func TestBatcherAttributesPartialIngest(t *testing.T) {
 	}
 }
 
-// Shutdown must not strand a half-full batch.
 func TestBatcherFlushesOnShutdown(t *testing.T) {
 	rec := &recorder{n: -1}
-	b := NewBatcher(rec.send, BatcherOptions{BatchSize: 20, MaxDelay: time.Hour})
+	b := NewBatcher(rec.send, BatcherOptions{BatchSize: 20, MaxFillWait: time.Hour})
 	ctx, cancel := context.WithCancel(context.Background())
 	go b.Run(ctx)
 
@@ -134,8 +132,7 @@ func TestBatcherFlushesOnShutdown(t *testing.T) {
 
 func TestBatcherDrainsQueueOnShutdown(t *testing.T) {
 	rec := &recorder{n: -1}
-	// BatchSize 2 with 5 records: one batch is pending, the rest are queued.
-	b := NewBatcher(rec.send, BatcherOptions{BatchSize: 2, MaxDelay: time.Hour, Grace: 5 * time.Second})
+	b := NewBatcher(rec.send, BatcherOptions{BatchSize: 2, MaxFillWait: time.Hour, DrainGrace: 5 * time.Second})
 	ctx, cancel := context.WithCancel(context.Background())
 
 	results := make([]<-chan error, 0, 5)
@@ -143,7 +140,6 @@ func TestBatcherDrainsQueueOnShutdown(t *testing.T) {
 		results = append(results, b.Submit(context.Background(), model.AnalyticsEvent{ID: int64(i)}))
 	}
 
-	// Run only starts now, so every record is sitting in the queue.
 	go b.Run(ctx)
 	cancel()
 	b.Wait()
@@ -167,11 +163,9 @@ func TestBatcherDrainsQueueOnShutdown(t *testing.T) {
 	}
 }
 
-// The Analytics Service answers 200 with a count, and that count may be short.
-// Reporting the shortfall as success is silent data loss.
 func TestBatcherReportsShortIngestCountAsFailure(t *testing.T) {
 	rec := &recorder{n: 1} // 200 OK, but only 1 of 3 items stored
-	b := runBatcher(t, rec, BatcherOptions{BatchSize: 3, MaxDelay: 20 * time.Millisecond})
+	b := runBatcher(t, rec, BatcherOptions{BatchSize: 3, MaxFillWait: 20 * time.Millisecond})
 
 	results := make([]<-chan error, 0, 3)
 	for i := 0; i < 3; i++ {

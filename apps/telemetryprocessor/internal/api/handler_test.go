@@ -21,7 +21,7 @@ func newHandler(t *testing.T, enrichURL, analyticsURL string) *IngestHandler {
 		Timeout: time.Second, RateRequests: 1000, RateWindow: time.Second, MaxRetries: 2,
 	})
 	batcher := analytics.NewBatcher(client.SendBatch, analytics.BatcherOptions{
-		BatchSize: 20, MaxDelay: 10 * time.Millisecond,
+		BatchSize: 20, MaxFillWait: 10 * time.Millisecond,
 	})
 	ctx, cancel := context.WithCancel(context.Background())
 	go batcher.Run(ctx)
@@ -33,7 +33,7 @@ func newHandler(t *testing.T, enrichURL, analyticsURL string) *IngestHandler {
 	return &IngestHandler{
 		Enrichment: enrichment.NewClient(enrichURL, "k", enrichment.Options{
 			Timeout: time.Second, MaxAttempts: 2, BackoffBase: time.Millisecond,
-			BackoffMax: time.Millisecond, BreakerTrip: 100, BreakerCooldown: time.Second,
+			BackoffMax: time.Millisecond, BreakerThreshold: 100, BreakerCooldown: time.Second,
 		}),
 		Analytics: batcher,
 	}
@@ -105,7 +105,7 @@ func TestHandlerUnknownCategorySkipped(t *testing.T) {
 	if res.FailedCategory != 1 || res.Enriched != 1 || res.Ingested != 1 {
 		t.Fatalf("unexpected result: %+v", res)
 	}
-	if len(res.RecordErrors) != 1 || res.RecordErrors[0].Stage != "category" {
+	if len(res.RecordErrors) != 1 || res.RecordErrors[0].Stage != model.StageCategory {
 		t.Fatalf("expected one category error, got %+v", res.RecordErrors)
 	}
 }
@@ -278,10 +278,10 @@ func TestHandlerStreamsProgress(t *testing.T) {
 		if err := dec.Decode(&ev); err != nil {
 			break
 		}
-		switch ev.Type {
-		case "progress":
+		switch ev.Kind {
+		case model.KindProgress:
 			progress = append(progress, ev)
-		case "result":
+		case model.KindResult:
 			ev := ev
 			final = &ev
 		}
@@ -326,8 +326,8 @@ func TestHandlerDoesNotStreamWithoutAcceptHeader(t *testing.T) {
 	if ct := w.Header().Get("Content-Type"); ct != "application/json" {
 		t.Fatalf("Content-Type = %q, want application/json", ct)
 	}
-	if res.Type != "" {
-		t.Fatalf("non-streaming response leaked a type discriminator: %q", res.Type)
+	if res.Kind != "" {
+		t.Fatalf("non-streaming response leaked a kind discriminator: %q", res.Kind)
 	}
 	if res.Ingested != 1 {
 		t.Fatalf("unexpected result: %+v", res)

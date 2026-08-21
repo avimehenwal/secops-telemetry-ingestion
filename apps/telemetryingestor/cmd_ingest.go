@@ -19,6 +19,13 @@ import (
 
 const ndjsonContentType = "application/x-ndjson"
 
+type frameKind string
+
+const (
+	frameProgress frameKind = "progress"
+	frameResult   frameKind = "result"
+)
+
 var errStreamTruncated = errors.New("progress stream ended before the final result")
 
 type ingestRecord struct {
@@ -33,7 +40,7 @@ type ingestRequest struct {
 }
 
 type ingestResult struct {
-	Type string `json:"type"`
+	Kind frameKind `json:"type"`
 
 	Received         int `json:"received"`
 	Enriched         int `json:"enriched"`
@@ -72,15 +79,12 @@ func runIngest(args []string) int {
 	// Resolve configuration precedence: flag > env > default.
 	resolvedEndpoint := resolveEndpoint(*endpoint, flagWasSet(fs, "endpoint"))
 
-	flt, err := filter.Parse(where)
+	rowFilter, err := filter.Parse(where)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		return 2
 	}
 
-	// The derived timeout needs the record count, so it is resolved after the
-	// file is read. Check the explicit values now so a bad flag is a usage
-	// error rather than something reported halfway through a run.
 	timeoutSet := flagWasSet(fs, "timeout")
 	if _, err := resolveTimeout(*timeout, timeoutSet, 0); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
@@ -97,7 +101,7 @@ func runIngest(args []string) int {
 
 	fmt.Printf("Ingesting %s\n", *file)
 	fmt.Printf("  endpoint:   %s\n", resolvedEndpoint)
-	if !flt.Empty() {
+	if !rowFilter.Empty() {
 		fmt.Printf("  filter:     %s\n", where.String())
 	}
 	if *dryRun {
@@ -109,14 +113,12 @@ func runIngest(args []string) int {
 	}
 
 	stats := ingestStats{}
-	records, err := readRecords(*file, flt, &stats)
+	records, err := readRecords(*file, rowFilter, &stats)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		return 1
 	}
 
-	// The timeout has to cover the upstream rate limit, which depends on how
-	// many records we are actually sending -- hence resolving it here.
 	resolvedTimeout, _ := resolveTimeout(*timeout, timeoutSet, len(records))
 
 	if len(records) == 0 {
@@ -165,11 +167,7 @@ func runIngest(args []string) int {
 	return stats.report(false)
 }
 
-// readRecords streams the CSV once, applying the filter and counting the rows
-// it had to skip. The whole file is held in memory: at ~60 bytes per record
-// even a million rows is small next to the ~8 hours the rate limit would need
-// to send them.
-func readRecords(path string, flt filter.Filter, stats *ingestStats) ([]ingestRecord, error) {
+func readRecords(path string, rowFilter filter.Filter, stats *ingestStats) ([]ingestRecord, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -187,18 +185,17 @@ func readRecords(path string, flt filter.Filter, stats *ingestStats) ([]ingestRe
 		if err == io.EOF {
 			break
 		}
-		// Every row the reader hands back counts as read, malformed included,
-		// so the summary adds up: read == filtered + skipped + sent.
 		stats.read++
 		if err != nil {
-			if _, ok := err.(*icsv.FieldCountError); ok {
+			var fieldCount *icsv.FieldCountError
+			if errors.As(err, &fieldCount) {
 				stats.skippedMalformed++
 				continue
 			}
 			return nil, err
 		}
 
-		if !flt.Match(rec) {
+		if !rowFilter.Match(rec) {
 			stats.filteredOut++
 			continue
 		}
@@ -277,11 +274,11 @@ func readProgressStream(body io.Reader, onProgress func(ingestResult)) (ingestRe
 			return ingestResult{}, fmt.Errorf("%w: %v", errStreamTruncated, err)
 		}
 
-		switch ev.Type {
-		case "result":
+		switch ev.Kind {
+		case frameResult:
 			ev.accounted = true
 			final = ev
-		case "progress":
+		case frameProgress:
 			if onProgress != nil {
 				onProgress(ev)
 			}
@@ -303,8 +300,6 @@ func progressLine(start time.Time, total int, ev ingestResult) string {
 		pct = float64(ev.Ingested) / float64(total) * 100
 	}
 
-	// Extrapolating from the observed rate self-corrects; the up-front estimate
-	// assumes perfectly full batches, which a lossy run never achieves.
 	eta := estimateDuration(total) - elapsed
 	if ev.Ingested > 0 {
 		eta = (elapsed / time.Duration(ev.Ingested)) * time.Duration(total-ev.Ingested)
@@ -333,8 +328,6 @@ type ingestStats struct {
 	unknown           int
 }
 
-// statLabelWidth must be >= the longest label below ("dropped (enrichment):")
-// so every value lands in the same column.
 const statLabelWidth = 22
 
 func printStat(label string, value int) {

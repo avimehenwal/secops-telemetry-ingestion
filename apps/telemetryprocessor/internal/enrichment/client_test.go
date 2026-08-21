@@ -14,12 +14,12 @@ import (
 
 func testOpts() Options {
 	return Options{
-		Timeout:         2 * time.Second,
-		MaxAttempts:     4,
-		BackoffBase:     time.Millisecond,
-		BackoffMax:      2 * time.Millisecond,
-		BreakerTrip:     3,
-		BreakerCooldown: 50 * time.Millisecond,
+		Timeout:          2 * time.Second,
+		MaxAttempts:      4,
+		BackoffBase:      time.Millisecond,
+		BackoffMax:       2 * time.Millisecond,
+		BreakerThreshold: 3,
+		BreakerCooldown:  50 * time.Millisecond,
 	}
 }
 
@@ -91,31 +91,76 @@ func TestEnrichCircuitBreakerOpens(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := NewClient(srv.URL, "k", testOpts()) // BreakerTrip=3
+	c := NewClient(srv.URL, "k", testOpts()) // BreakerThreshold=3, cooldown 50ms
 
-	// Each Enrich exhausts its retries and counts as one breaker failure.
-	// After 3 such failures the breaker opens and short-circuits.
 	for i := 0; i < 3; i++ {
 		if _, err := c.Enrich(context.Background(), model.Logline{}); err == nil {
 			t.Fatal("expected failure")
 		}
 	}
-	callsBeforeOpen := atomic.LoadInt32(&calls)
-
-	_, err := c.Enrich(context.Background(), model.Logline{})
-	if err != ErrCircuitOpen {
-		t.Fatalf("expected ErrCircuitOpen, got %v", err)
+	if open, _, _ := c.breaker.allow(); open {
+		t.Fatal("breaker should be open after BreakerThreshold failures")
 	}
-	if atomic.LoadInt32(&calls) != callsBeforeOpen {
+}
+
+func TestEnrichWaitsOutABrownout(t *testing.T) {
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt32(&calls, 1) <= 12 {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(model.EnrichmentDetails{ASN: "ASN1337", Category: "T1566", CorrelationID: 7})
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, "k", testOpts())
+	for i := 0; i < 3; i++ {
+		if _, err := c.Enrich(context.Background(), model.Logline{}); err == nil {
+			t.Fatal("expected failure while the service is down")
+		}
+	}
+
+	details, err := c.Enrich(context.Background(), model.Logline{})
+	if err != nil {
+		t.Fatalf("record dropped instead of waiting out the breaker: %v", err)
+	}
+	if details.Category != "T1566" {
+		t.Fatalf("got %+v", details)
+	}
+}
+
+func TestEnrichFailsFastWhenHardDown(t *testing.T) {
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, "k", testOpts())
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := c.Enrich(context.Background(), model.Logline{}); err == ErrCircuitOpen {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("breaker never gave up on the dead service")
+		}
+	}
+
+	callsBefore := atomic.LoadInt32(&calls)
+	start := time.Now()
+	for i := 0; i < 50; i++ {
+		if _, err := c.Enrich(context.Background(), model.Logline{}); err != ErrCircuitOpen {
+			t.Fatalf("expected ErrCircuitOpen, got %v", err)
+		}
+	}
+	if elapsed := time.Since(start); elapsed > 40*time.Millisecond {
+		t.Fatalf("hard-down breaker still made callers wait: %s for 50 calls", elapsed)
+	}
+	if atomic.LoadInt32(&calls) != callsBefore {
 		t.Fatal("open breaker should not make network calls")
-	}
-
-	// After cooldown the breaker half-opens and allows a trial call.
-	time.Sleep(60 * time.Millisecond)
-	if _, err := c.Enrich(context.Background(), model.Logline{}); err == ErrCircuitOpen {
-		t.Fatal("breaker should allow a trial call after cooldown")
-	}
-	if atomic.LoadInt32(&calls) <= callsBeforeOpen {
-		t.Fatal("half-open breaker should make a network call")
 	}
 }

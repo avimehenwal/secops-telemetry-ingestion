@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strconv"
 	"time"
@@ -16,30 +17,50 @@ import (
 
 const UpstreamMaxBatchSize = 20
 
+const defaultRetryAfter = 10 * time.Second
+
 type Options struct {
 	Timeout      time.Duration // per-attempt HTTP timeout
 	RateRequests int           // requests permitted per RateWindow (upstream allows 1)
 	RateWindow   time.Duration // the rate-limit window
 	MaxRetries   int           // retries on HTTP 429
+	Logger       *log.Logger   // optional; retries are logged here
 }
 
 type Client struct {
-	baseURL  string
-	apiKey   string
-	http     *http.Client
-	maxRetry int
-	limiter  *ratelimit.Bucket
+	baseURL    string
+	apiKey     string
+	http       *http.Client
+	maxRetries int
+	limiter    *ratelimit.Bucket
+	logger     *log.Logger
 }
 
 func NewClient(baseURL, apiKey string, opts Options) *Client {
 	return &Client{
-		baseURL:  baseURL,
-		apiKey:   apiKey,
-		http:     &http.Client{Timeout: opts.Timeout},
-		maxRetry: opts.MaxRetries,
-		limiter:  ratelimit.New(opts.RateRequests, opts.RateWindow),
+		baseURL:    baseURL,
+		apiKey:     apiKey,
+		http:       &http.Client{Timeout: opts.Timeout},
+		maxRetries: opts.MaxRetries,
+		limiter:    ratelimit.New(opts.RateRequests, opts.RateWindow),
+		logger:     opts.Logger,
 	}
 }
+
+func (c *Client) logf(format string, args ...any) {
+	if c.logger != nil {
+		c.logger.Printf(format, args...)
+	}
+}
+
+type attempt struct {
+	ingested  int
+	err       error
+	permanent bool          // no retry can change this outcome
+	retryIn   time.Duration // how long to wait before retrying
+}
+
+func (a attempt) ok() bool { return a.err == nil }
 
 func (c *Client) SendBatch(ctx context.Context, batch []model.AnalyticsEvent) (int, error) {
 	if len(batch) == 0 {
@@ -55,7 +76,7 @@ func (c *Client) SendBatch(ctx context.Context, batch []model.AnalyticsEvent) (i
 	}
 
 	var lastErr error
-	for attempt := 0; attempt <= c.maxRetry; attempt++ {
+	for try := 0; try <= c.maxRetries; try++ {
 		if err := ctx.Err(); err != nil {
 			return 0, err
 		}
@@ -66,74 +87,80 @@ func (c *Client) SendBatch(ctx context.Context, batch []model.AnalyticsEvent) (i
 			return 0, err
 		}
 
-		n, retryAfter, err := c.postOnce(ctx, body, len(batch))
-		if err == nil {
-			return n, nil
+		result := c.sendOnce(ctx, body, len(batch))
+		if result.ok() {
+			return result.ingested, nil
 		}
-		lastErr = err
-		if retryAfter < 0 {
-			// Permanent: return n as well as the error, because a partial
-			// success still tells the caller which events it need not mourn.
-			return n, err
+		lastErr = result.err
+		if result.permanent {
+			return result.ingested, result.err
 		}
-		if attempt < c.maxRetry {
-			if err := sleep(ctx, retryAfter); err != nil {
+		if try < c.maxRetries {
+			c.logf("analytics retry: attempt=%d/%d error=%v backoff=%s", try+1, c.maxRetries+1, result.err, result.retryIn)
+			if err := sleep(ctx, result.retryIn); err != nil {
 				return 0, err
 			}
 		}
 	}
-	return 0, fmt.Errorf("analytics batch failed after %d attempt(s): %w", c.maxRetry+1, lastErr)
+	return 0, fmt.Errorf("analytics batch failed after %d attempt(s): %w", c.maxRetries+1, lastErr)
 }
 
-func (c *Client) postOnce(ctx context.Context, body []byte, count int) (n int, retryAfter time.Duration, err error) {
+func (c *Client) sendOnce(ctx context.Context, body []byte, count int) attempt {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL, bytes.NewReader(body))
 	if err != nil {
-		return 0, -1, fmt.Errorf("building request: %w", err)
+		return attempt{err: fmt.Errorf("building request: %w", err), permanent: true}
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", c.apiKey)
 
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return 0, 0, err // network error: retry immediately (limiter still gates rate)
+		// Network error: retry immediately (the limiter still gates the rate).
+		return attempt{err: err}
 	}
 	defer resp.Body.Close()
 
 	switch {
 	case resp.StatusCode == http.StatusOK:
-		var out model.AnalyticsSuccessResponse
-		if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		var body model.AnalyticsSuccessResponse
+		if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
 			// A 200 we cannot parse: assume the batch landed. Retrying would
 			// duplicate events upstream, which is worse than an optimistic count.
-			return count, -1, nil
+			return attempt{ingested: count}
 		}
-		if out.Status == "error" {
-			// 200 + status=error is the service telling us the batch was not
-			// (fully) stored. Not retryable: a replay would duplicate whatever
-			// itemsIngested does cover.
-			return int(out.ItemsIngested), -1, fmt.Errorf(
-				"analytics reported status=error (%d of %d items ingested)", out.ItemsIngested, count)
+		if body.Status == "error" {
+			// 200 + status=error means the batch was not (fully) stored. Not
+			// retryable: a replay would duplicate whatever itemsIngested covers.
+			return attempt{
+				ingested:  int(body.ItemsIngested),
+				permanent: true,
+				err: fmt.Errorf("analytics reported status=error (%d of %d items ingested)",
+					body.ItemsIngested, count),
+			}
 		}
-		return int(out.ItemsIngested), 0, nil
+		return attempt{ingested: int(body.ItemsIngested)}
+
 	case resp.StatusCode == http.StatusTooManyRequests:
-		return 0, retryAfterDelay(resp), fmt.Errorf("analytics rate limited (429)")
+		return attempt{err: fmt.Errorf("analytics rate limited (429)"), retryIn: retryAfter(resp)}
+
 	case resp.StatusCode >= 500:
-		return 0, 0, fmt.Errorf("analytics %s", status(resp))
+		return attempt{err: fmt.Errorf("analytics %s", describe(resp))}
+
 	default:
-		return 0, -1, fmt.Errorf("analytics %s", status(resp))
+		return attempt{err: fmt.Errorf("analytics %s", describe(resp)), permanent: true}
 	}
 }
 
-func retryAfterDelay(resp *http.Response) time.Duration {
+func retryAfter(resp *http.Response) time.Duration {
 	if v := resp.Header.Get("Retry-After"); v != "" {
 		if secs, err := strconv.Atoi(v); err == nil && secs >= 0 {
 			return time.Duration(secs) * time.Second
 		}
 	}
-	return 10 * time.Second
+	return defaultRetryAfter
 }
 
-func status(resp *http.Response) string {
+func describe(resp *http.Response) string {
 	snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
 	if len(bytes.TrimSpace(snippet)) == 0 {
 		return resp.Status

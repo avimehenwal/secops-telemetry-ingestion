@@ -17,8 +17,8 @@ func TestLoadDefaults(t *testing.T) {
 	if c.APIKey != "eye-am-hiring" {
 		t.Errorf("APIKey = %q", c.APIKey)
 	}
-	if c.AnalyticsRateRequest != 1 || c.AnalyticsRateWindow != 10*time.Second {
-		t.Errorf("rate = %d req/%s, want 1 req/10s per the OpenAPI spec", c.AnalyticsRateRequest, c.AnalyticsRateWindow)
+	if c.AnalyticsRateRequests != 1 || c.AnalyticsRateWindow != 10*time.Second {
+		t.Errorf("rate = %d req/%s, want 1 req/10s per the OpenAPI spec", c.AnalyticsRateRequests, c.AnalyticsRateWindow)
 	}
 }
 
@@ -36,8 +36,8 @@ func TestLoadOverrides(t *testing.T) {
 	if c.Addr != ":9999" || c.APIKey != "secret" {
 		t.Errorf("overrides not applied: %+v", c)
 	}
-	if c.AnalyticsRateRequest != 5 || c.AnalyticsRateWindow != 3*time.Second {
-		t.Errorf("rate override not applied: %d/%s", c.AnalyticsRateRequest, c.AnalyticsRateWindow)
+	if c.AnalyticsRateRequests != 5 || c.AnalyticsRateWindow != 3*time.Second {
+		t.Errorf("rate override not applied: %d/%s", c.AnalyticsRateRequests, c.AnalyticsRateWindow)
 	}
 	if c.EnrichmentBackoffBase != 50*time.Millisecond {
 		t.Errorf("backoff override not applied: %s", c.EnrichmentBackoffBase)
