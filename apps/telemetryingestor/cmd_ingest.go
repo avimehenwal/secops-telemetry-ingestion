@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -9,8 +10,10 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	icsv "github.com/avimehenwal/secops-telemetry-ingestion/apps/telemetryingestor/internal/csv"
@@ -49,9 +52,15 @@ type ingestResult struct {
 	FailedCategory   int `json:"failedCategory"`
 	FailedAnalytics  int `json:"failedAnalytics"`
 
-	// accounted is false when the processor accepted the request but returned
-	// a body we could not read, so its per-record outcome is unknown.
+	RecordErrors []recordError `json:"recordErrors,omitempty"`
+
 	accounted bool
+}
+
+type recordError struct {
+	ID     int64  `json:"id,omitempty"`
+	Stage  string `json:"stage"`
+	Reason string `json:"reason"`
 }
 
 func runIngest(args []string) int {
@@ -70,6 +79,10 @@ func runIngest(args []string) int {
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
 	if *file == "" {
 		fs.Usage()
 		fmt.Fprintln(os.Stderr, "\nerror: -file is required")
@@ -113,8 +126,12 @@ func runIngest(args []string) int {
 	}
 
 	stats := ingestStats{}
-	records, err := readRecords(*file, rowFilter, &stats)
-	if err != nil {
+	records, err := readRecords(ctx, *file, rowFilter, &stats)
+	switch {
+	case errors.Is(err, context.Canceled):
+		fmt.Fprintln(os.Stderr, "\ninterrupted before sending; nothing was ingested")
+		return 1
+	case err != nil:
 		fmt.Fprintln(os.Stderr, "error:", err)
 		return 1
 	}
@@ -139,8 +156,12 @@ func runIngest(args []string) int {
 	fmt.Println("  sending...")
 
 	start := time.Now()
-	res, err := postRecords(&http.Client{Timeout: resolvedTimeout}, resolvedEndpoint, records,
-		func(ev ingestResult) { fmt.Println(progressLine(start, len(records), ev)) })
+	var lastProgress ingestResult
+	res, err := postRecords(ctx, &http.Client{Timeout: resolvedTimeout}, resolvedEndpoint, records,
+		func(ev ingestResult) {
+			lastProgress = ev
+			fmt.Println(progressLine(start, len(records), ev))
+		})
 	switch {
 	case err == nil && !res.accounted:
 		stats.accepted = len(records)
@@ -152,7 +173,14 @@ func runIngest(args []string) int {
 		stats.droppedCategory = res.FailedCategory
 		stats.droppedEnrichment = res.FailedEnrichment
 		stats.droppedAnalytics = res.FailedAnalytics
+		stats.recordErrors = res.RecordErrors
 		fmt.Println("  done")
+	case errors.Is(err, context.Canceled):
+		stats.accepted = len(records)
+		stats.ingested = lastProgress.Ingested
+		stats.unknown = len(records) - lastProgress.Ingested
+		stats.interrupted = true
+		fmt.Fprintln(os.Stderr, "\n  interrupted")
 	case isTimeout(err) || errors.Is(err, errStreamTruncated):
 		// The processor may well have finished the work after we hung up:
 		// calling this "failed" would be a lie, and a blind retry would
@@ -167,7 +195,9 @@ func runIngest(args []string) int {
 	return stats.report(false)
 }
 
-func readRecords(path string, rowFilter filter.Filter, stats *ingestStats) ([]ingestRecord, error) {
+const ctxCheckInterval = 512
+
+func readRecords(ctx context.Context, path string, rowFilter filter.Filter, stats *ingestStats) ([]ingestRecord, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -186,6 +216,11 @@ func readRecords(path string, rowFilter filter.Filter, stats *ingestStats) ([]in
 			break
 		}
 		stats.read++
+		if stats.read%ctxCheckInterval == 0 {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+		}
 		if err != nil {
 			var fieldCount *icsv.FieldCountError
 			if errors.As(err, &fieldCount) {
@@ -224,12 +259,12 @@ func toIngestRecord(r icsv.Record) (ingestRecord, bool) {
 	}, true
 }
 
-func postRecords(client *http.Client, endpoint string, records []ingestRecord, onProgress func(ingestResult)) (ingestResult, error) {
+func postRecords(ctx context.Context, client *http.Client, endpoint string, records []ingestRecord, onProgress func(ingestResult)) (ingestResult, error) {
 	body, err := json.Marshal(ingestRequest{Records: records})
 	if err != nil {
 		return ingestResult{}, fmt.Errorf("marshalling request: %w", err)
 	}
-	req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
 		return ingestResult{}, fmt.Errorf("building request: %w", err)
 	}
@@ -238,6 +273,9 @@ func postRecords(client *http.Client, endpoint string, records []ingestRecord, o
 
 	resp, err := client.Do(req)
 	if err != nil {
+		if ctx.Err() != nil {
+			return ingestResult{}, ctx.Err()
+		}
 		return ingestResult{}, err
 	}
 	defer resp.Body.Close()
@@ -248,7 +286,7 @@ func postRecords(client *http.Client, endpoint string, records []ingestRecord, o
 	}
 
 	if strings.Contains(resp.Header.Get("Content-Type"), ndjsonContentType) {
-		return readProgressStream(resp.Body, onProgress)
+		return readProgressStream(ctx, resp.Body, onProgress)
 	}
 
 	var res ingestResult
@@ -260,7 +298,7 @@ func postRecords(client *http.Client, endpoint string, records []ingestRecord, o
 	return res, nil
 }
 
-func readProgressStream(body io.Reader, onProgress func(ingestResult)) (ingestResult, error) {
+func readProgressStream(ctx context.Context, body io.Reader, onProgress func(ingestResult)) (ingestResult, error) {
 	dec := json.NewDecoder(body)
 
 	var final ingestResult
@@ -271,6 +309,9 @@ func readProgressStream(body io.Reader, onProgress func(ingestResult)) (ingestRe
 			break
 		}
 		if err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ingestResult{}, ctxErr
+			}
 			return ingestResult{}, fmt.Errorf("%w: %v", errStreamTruncated, err)
 		}
 
@@ -326,9 +367,34 @@ type ingestStats struct {
 	droppedAnalytics  int
 	failed            int
 	unknown           int
+	interrupted       bool
+	recordErrors      []recordError
 }
 
+const maxPrintedErrors = 20
+
 const statLabelWidth = 22
+
+func (s ingestStats) reportRecordErrors() {
+	if len(s.recordErrors) == 0 {
+		return
+	}
+
+	dropped := s.droppedCategory + s.droppedEnrichment + s.droppedAnalytics
+	fmt.Printf("\nFailures (%d of %d):\n", min(len(s.recordErrors), maxPrintedErrors), dropped)
+	for i, e := range s.recordErrors {
+		if i == maxPrintedErrors {
+			fmt.Printf("  ... and %d more; see the processor log for the full list\n",
+				dropped-maxPrintedErrors)
+			break
+		}
+		fmt.Printf("  record %d [%s] %s\n", e.ID, e.Stage, e.Reason)
+	}
+	if dropped > len(s.recordErrors) && len(s.recordErrors) < maxPrintedErrors {
+		fmt.Printf("  (processor reported only the first %d of %d failures)\n",
+			len(s.recordErrors), dropped)
+	}
+}
 
 func printStat(label string, value int) {
 	fmt.Printf("  %-*s%d\n", statLabelWidth, label, value)
@@ -368,6 +434,8 @@ func (s ingestStats) report(dryRun bool) int {
 		printStat("dropped (analytics):", s.droppedAnalytics)
 	}
 
+	s.reportRecordErrors()
+
 	exit := 0
 	if s.failed > 0 {
 		printStat("failed:", s.failed)
@@ -375,8 +443,14 @@ func (s ingestStats) report(dryRun bool) int {
 	}
 	if s.unknown > 0 {
 		printStat("outcome unknown:", s.unknown)
-		fmt.Println("\nThe request timed out but may still have been ingested. Re-run with a\n" +
-			"longer -timeout, and expect duplicates for these records.")
+		if s.interrupted {
+			fmt.Println("\nInterrupted. The counts above are the last the processor confirmed; a\n" +
+				"few records already queued upstream may still land after this. Re-running\n" +
+				"will duplicate whatever did.")
+		} else {
+			fmt.Println("\nThe request timed out but may still have been ingested. Re-run with a\n" +
+				"longer -timeout, and expect duplicates for these records.")
+		}
 		exit = 1
 	}
 	if s.ingested < s.accepted-s.unaccounted && exit == 0 {

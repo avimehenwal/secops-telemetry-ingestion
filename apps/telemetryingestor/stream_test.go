@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"strings"
 	"testing"
@@ -14,7 +15,7 @@ func TestReadProgressStreamReportsEachEventAndReturnsResult(t *testing.T) {
 			`{"type":"result","received":45,"enriched":45,"ingested":44,"failedAnalytics":1}` + "\n")
 
 	var seen []int
-	res, err := readProgressStream(body, func(ev ingestResult) {
+	res, err := readProgressStream(context.Background(), body, func(ev ingestResult) {
 		seen = append(seen, ev.Ingested)
 	})
 	if err != nil {
@@ -32,24 +33,21 @@ func TestReadProgressStreamReportsEachEventAndReturnsResult(t *testing.T) {
 	}
 }
 
-// A stream cut short is not a success with fewer records: the processor may
-// have forwarded more after the connection dropped, so the outcome is unknown.
 func TestReadProgressStreamTruncatedIsUnknownNotSuccess(t *testing.T) {
 	body := strings.NewReader(
 		`{"type":"progress","received":45,"ingested":20}` + "\n" +
 			`{"type":"progress","received":45,"ing`) // cut mid-object
 
-	_, err := readProgressStream(body, nil)
+	_, err := readProgressStream(context.Background(), body, nil)
 	if !errors.Is(err, errStreamTruncated) {
 		t.Fatalf("err = %v, want errStreamTruncated", err)
 	}
 }
 
-// Progress events without a closing result must not be mistaken for a result.
 func TestReadProgressStreamWithoutResultIsTruncated(t *testing.T) {
 	body := strings.NewReader(`{"type":"progress","received":45,"ingested":20}` + "\n")
 
-	_, err := readProgressStream(body, nil)
+	_, err := readProgressStream(context.Background(), body, nil)
 	if !errors.Is(err, errStreamTruncated) {
 		t.Fatalf("err = %v, want errStreamTruncated", err)
 	}

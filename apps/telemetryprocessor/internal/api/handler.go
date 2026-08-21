@@ -201,6 +201,7 @@ func (h *IngestHandler) countFailure(result *model.IngestResult, id int64, stage
 	case model.StageAnalytics:
 		result.FailedAnalytics++
 	}
+	h.logf("record failed: id=%d stage=%s reason=%q", id, stage, reason)
 	if len(result.RecordErrors) < maxReportedErrors {
 		result.RecordErrors = append(result.RecordErrors,
 			model.RecordError{ID: id, Stage: stage, Reason: reason})
