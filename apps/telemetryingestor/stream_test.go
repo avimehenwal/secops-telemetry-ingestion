@@ -57,7 +57,7 @@ func TestProgressLineUsesObservedRateForETA(t *testing.T) {
 	// 20 of 100 records in 10s => 0.5s each => 40 remaining => ~20s to go.
 	line := progressLine(time.Now().Add(-10*time.Second), 100, ingestResult{Ingested: 20, Enriched: 35})
 
-	for _, want := range []string{"[ 20/100]", "20.0%", "enriched 35", "elapsed 10s", "eta 40s"} {
+	for _, want := range []string{"[ 20/100]", "20.0%", "enriched  35", "elapsed 00:10", "eta 00:40"} {
 		if !strings.Contains(line, want) {
 			t.Errorf("progress line %q missing %q", line, want)
 		}

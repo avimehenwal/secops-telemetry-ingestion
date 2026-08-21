@@ -1,7 +1,7 @@
 package api
 
 import (
-	"log"
+	"log/slog"
 	"net/http"
 	"time"
 )
@@ -32,7 +32,7 @@ func (r *responseRecorder) Flush() {
 	}
 }
 
-func LoggingMiddleware(logger *log.Logger, next http.Handler) http.Handler {
+func LoggingMiddleware(logger *slog.Logger, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		rec := &responseRecorder{ResponseWriter: w}
@@ -43,7 +43,12 @@ func LoggingMiddleware(logger *log.Logger, next http.Handler) http.Handler {
 		if status == 0 {
 			status = http.StatusOK
 		}
-		logger.Printf("http request: method=%s path=%s status=%d bytes=%d duration=%s remoteAddr=%s",
-			r.Method, r.URL.Path, status, rec.bytes, time.Since(start), r.RemoteAddr)
+		logger.Info("http request",
+			"method", r.Method,
+			"path", r.URL.Path,
+			"status", status,
+			"bytes", rec.bytes,
+			"durationMs", time.Since(start).Milliseconds(),
+			"remoteAddr", r.RemoteAddr)
 	})
 }

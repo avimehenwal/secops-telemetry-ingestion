@@ -4,10 +4,12 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
 type Config struct {
+	Environment   string // deployment environment, e.g. "development", "production"
 	Addr          string
 	EnrichmentURL string
 	AnalyticsURL  string
@@ -32,6 +34,7 @@ type Config struct {
 
 func Load() (Config, error) {
 	c := Config{
+		Environment:   Environment(),
 		Addr:          getenv("PROCESSOR_ADDR", ":8080"),
 		EnrichmentURL: getenv("ENRICHMENT_URL", "https://api.heyering.com/enrichment"),
 		AnalyticsURL:  getenv("ANALYTICS_URL", "https://api.heyering.com/analytics"),
@@ -111,6 +114,19 @@ func (c Config) validate() error {
 		return fmt.Errorf("ANALYTICS_MAX_RETRIES must be >= 0, got %d", c.AnalyticsMaxRetries)
 	}
 	return nil
+}
+
+func Environment() string {
+	return strings.ToLower(strings.TrimSpace(getenv("APP_ENV", "development")))
+}
+
+func IsLocal(env string) bool {
+	switch strings.ToLower(strings.TrimSpace(env)) {
+	case "", "local", "dev", "development":
+		return true
+	default:
+		return false
+	}
 }
 
 func getenv(key, fallback string) string {

@@ -6,7 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"time"
@@ -24,7 +24,7 @@ type Options struct {
 	RateRequests int           // requests permitted per RateWindow (upstream allows 1)
 	RateWindow   time.Duration // the rate-limit window
 	MaxRetries   int           // retries on HTTP 429
-	Logger       *log.Logger   // optional; retries are logged here
+	Logger       *slog.Logger  // optional; retries are logged here
 }
 
 type Client struct {
@@ -33,23 +33,21 @@ type Client struct {
 	http       *http.Client
 	maxRetries int
 	limiter    *ratelimit.Bucket
-	logger     *log.Logger
+	logger     *slog.Logger
 }
 
 func NewClient(baseURL, apiKey string, opts Options) *Client {
+	logger := opts.Logger
+	if logger == nil {
+		logger = slog.New(slog.DiscardHandler)
+	}
 	return &Client{
 		baseURL:    baseURL,
 		apiKey:     apiKey,
 		http:       &http.Client{Timeout: opts.Timeout},
 		maxRetries: opts.MaxRetries,
 		limiter:    ratelimit.New(opts.RateRequests, opts.RateWindow),
-		logger:     opts.Logger,
-	}
-}
-
-func (c *Client) logf(format string, args ...any) {
-	if c.logger != nil {
-		c.logger.Printf(format, args...)
+		logger:     logger,
 	}
 }
 
@@ -96,7 +94,11 @@ func (c *Client) SendBatch(ctx context.Context, batch []model.AnalyticsEvent) (i
 			return result.ingested, result.err
 		}
 		if try < c.maxRetries {
-			c.logf("analytics retry: attempt=%d/%d error=%v backoff=%s", try+1, c.maxRetries+1, result.err, result.retryIn)
+			c.logger.Warn("upstream request failed, retrying",
+				"attempt", try+1,
+				"maxAttempts", c.maxRetries+1,
+				"backoff", result.retryIn.String(),
+				"error", result.err.Error())
 			if err := sleep(ctx, result.retryIn); err != nil {
 				return 0, err
 			}

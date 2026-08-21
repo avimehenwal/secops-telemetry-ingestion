@@ -7,7 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"math"
 	"net/http"
 	"time"
@@ -22,7 +22,7 @@ type Options struct {
 	BackoffMax       time.Duration // cap on a single backoff sleep
 	BreakerThreshold int           // consecutive failures before the breaker opens
 	BreakerCooldown  time.Duration // how long the breaker stays open
-	Logger           *log.Logger   // optional; retries and breaker waits are logged here
+	Logger           *slog.Logger  // optional; retries and breaker waits are logged here
 }
 
 type Client struct {
@@ -31,12 +31,16 @@ type Client struct {
 	http    *http.Client
 	opts    Options
 	breaker *breaker
-	logger  *log.Logger
+	logger  *slog.Logger
 }
 
 func NewClient(baseURL, apiKey string, opts Options) *Client {
 	if opts.MaxAttempts < 1 {
 		opts.MaxAttempts = 1
+	}
+	logger := opts.Logger
+	if logger == nil {
+		logger = slog.New(slog.DiscardHandler)
 	}
 	return &Client{
 		baseURL: baseURL,
@@ -44,13 +48,7 @@ func NewClient(baseURL, apiKey string, opts Options) *Client {
 		http:    &http.Client{Timeout: opts.Timeout},
 		opts:    opts,
 		breaker: newBreaker(opts.BreakerThreshold, opts.BreakerCooldown),
-		logger:  opts.Logger,
-	}
-}
-
-func (c *Client) logf(format string, args ...any) {
-	if c.logger != nil {
-		c.logger.Printf(format, args...)
+		logger:  logger,
 	}
 }
 
@@ -65,7 +63,7 @@ func (c *Client) Enrich(ctx context.Context, rec model.Logline) (model.Enrichmen
 		if hardDown {
 			return model.EnrichmentDetails{}, ErrCircuitOpen
 		}
-		c.logf("enrichment breaker open: waiting %s before next trial", retryIn)
+		c.logger.Warn("circuit breaker open, waiting before next attempt", "wait", retryIn.String())
 		if err := sleep(ctx, retryIn); err != nil {
 			return model.EnrichmentDetails{}, err
 		}
@@ -94,7 +92,11 @@ func (c *Client) Enrich(ctx context.Context, rec model.Logline) (model.Enrichmen
 
 		if attempt < c.opts.MaxAttempts {
 			backoff := c.backoff(attempt)
-			c.logf("enrichment retry: attempt=%d/%d error=%v backoff=%s", attempt, c.opts.MaxAttempts, err, backoff)
+			c.logger.Warn("upstream request failed, retrying",
+				"attempt", attempt,
+				"maxAttempts", c.opts.MaxAttempts,
+				"backoff", backoff.String(),
+				"error", err.Error())
 			if err := sleep(ctx, backoff); err != nil {
 				return model.EnrichmentDetails{}, err
 			}
@@ -115,7 +117,6 @@ func (c *Client) enrichOnce(ctx context.Context, body []byte) (model.EnrichmentD
 
 	resp, err := c.http.Do(req)
 	if err != nil {
-		// Network/timeout errors are transient.
 		return model.EnrichmentDetails{}, true, err
 	}
 	defer resp.Body.Close()
@@ -128,7 +129,6 @@ func (c *Client) enrichOnce(ctx context.Context, body []byte) (model.EnrichmentD
 		}
 		return details, false, nil
 	case resp.StatusCode == http.StatusBadRequest:
-		// Invalid input: permanent, do not retry.
 		return model.EnrichmentDetails{}, false, fmt.Errorf("enrichment rejected record: %s", describe(resp))
 	case resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500:
 		// Overload / server error: transient.

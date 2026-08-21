@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"strings"
 	"sync/atomic"
@@ -25,33 +25,34 @@ const (
 type IngestHandler struct {
 	Enrichment *enrichment.Client
 	Analytics  *analytics.Batcher
-	Logger     *log.Logger
+	Logger     *slog.Logger
 }
 
-func (h *IngestHandler) logf(format string, args ...any) {
+func (h *IngestHandler) log() *slog.Logger {
 	if h.Logger != nil {
-		h.Logger.Printf(format, args...)
+		return h.Logger
 	}
+	return slog.New(slog.DiscardHandler)
 }
 
 func (h *IngestHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	h.logf("request received: method=%s path=%s remoteAddr=%s", r.Method, r.URL.Path, r.RemoteAddr)
+	h.log().Info("request received", "method", r.Method, "path", r.URL.Path, "remoteAddr", r.RemoteAddr)
 
 	if r.Method != http.MethodPost {
-		h.logf("response sent: status=%d reason=method-not-allowed", http.StatusMethodNotAllowed)
+		h.log().Warn("request rejected", "status", http.StatusMethodNotAllowed, "reason", "method-not-allowed")
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
 	var req model.IngestRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.logf("response sent: status=%d reason=invalid-body error=%q", http.StatusBadRequest, err.Error())
+		h.log().Warn("request rejected", "status", http.StatusBadRequest, "reason", "invalid-body", "error", err.Error())
 		http.Error(w, "invalid request body: "+err.Error(), http.StatusBadRequest)
 		return
 	}
 
 	dryRun := isDryRun(r)
-	h.logf("request body decoded: records=%d dryRun=%t", len(req.Records), dryRun)
+	h.log().Info("request body decoded", "records", len(req.Records), "dryRun", dryRun)
 
 	// Streaming is opt-in and needs a ResponseWriter that can flush, so the
 	// plain path stays the default and the fallback.
@@ -63,7 +64,7 @@ func (h *IngestHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	result := h.runPipeline(r.Context(), req.Records, dryRun, nil)
 	status := statusFor(result)
 	h.logResult(result)
-	h.logf("response sent: status=%d", status)
+	h.log().Info("response sent", "status", status)
 	writeJSON(w, status, result)
 }
 
@@ -89,7 +90,7 @@ func (h *IngestHandler) serveStream(w http.ResponseWriter, flusher http.Flusher,
 	result.Kind = model.KindResult
 	writeFrame(result)
 	h.logResult(result)
-	h.logf("response sent: status=%d streamed=true", http.StatusOK)
+	h.log().Info("response sent", "status", http.StatusOK, "streamed", true)
 }
 
 type recordOutcome struct {
@@ -126,9 +127,12 @@ func (h *IngestHandler) runPipeline(ctx context.Context, records []model.Record,
 
 		settled++
 		if settled%progressInterval == 0 {
-			h.logf("ingest progress: settled=%d/%d enriched=%d ingested=%d failed=%d",
-				settled, len(records), enrichedAhead.Load(), result.Ingested,
-				result.FailedCategory+result.FailedEnrichment+result.FailedAnalytics)
+			h.log().Info("ingest progress",
+				"settled", settled,
+				"total", len(records),
+				"enriched", enrichedAhead.Load(),
+				"ingested", result.Ingested,
+				"failed", result.FailedCategory+result.FailedEnrichment+result.FailedAnalytics)
 			if onProgress != nil {
 				onProgress(progressFrame(result, enrichedAhead.Load()))
 			}
@@ -136,7 +140,7 @@ func (h *IngestHandler) runPipeline(ctx context.Context, records []model.Record,
 	}
 
 	if result.FailedAnalytics > 0 {
-		h.logf("analytics delivery failed for %d record(s)", result.FailedAnalytics)
+		h.log().Warn("analytics delivery failed for records", "count", result.FailedAnalytics)
 	}
 	return result
 }
@@ -158,7 +162,7 @@ func (h *IngestHandler) produce(ctx context.Context, records []model.Record, out
 		details, err := h.Enrichment.Enrich(ctx, rec.Logline(normalised))
 		if err != nil {
 			if ctx.Err() != nil {
-				h.logf("ingest aborted mid-enrichment: %v", ctx.Err())
+				h.log().Warn("ingest aborted mid-enrichment", "error", ctx.Err().Error())
 				return
 			}
 			outcomes <- recordOutcome{id: rec.ID, stage: model.StageEnrichment, reason: err.Error()}
@@ -201,7 +205,7 @@ func (h *IngestHandler) countFailure(result *model.IngestResult, id int64, stage
 	case model.StageAnalytics:
 		result.FailedAnalytics++
 	}
-	h.logf("record failed: id=%d stage=%s reason=%q", id, stage, reason)
+	h.log().Warn("record failed", "id", id, "stage", string(stage), "reason", reason)
 	if len(result.RecordErrors) < maxReportedErrors {
 		result.RecordErrors = append(result.RecordErrors,
 			model.RecordError{ID: id, Stage: stage, Reason: reason})
@@ -209,9 +213,14 @@ func (h *IngestHandler) countFailure(result *model.IngestResult, id int64, stage
 }
 
 func (h *IngestHandler) logResult(result model.IngestResult) {
-	h.logf("ingest complete: dryRun=%t received=%d enriched=%d ingested=%d failedCategory=%d failedEnrichment=%d failedAnalytics=%d",
-		result.DryRun, result.Received, result.Enriched, result.Ingested,
-		result.FailedCategory, result.FailedEnrichment, result.FailedAnalytics)
+	h.log().Info("ingest complete",
+		"dryRun", result.DryRun,
+		"received", result.Received,
+		"enriched", result.Enriched,
+		"ingested", result.Ingested,
+		"failedCategory", result.FailedCategory,
+		"failedEnrichment", result.FailedEnrichment,
+		"failedAnalytics", result.FailedAnalytics)
 }
 
 func statusFor(result model.IngestResult) int {

@@ -4,10 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -15,14 +16,21 @@ import (
 	"github.com/avimehenwal/secops-telemetry-ingestion/apps/telemetryprocessor/internal/api"
 	"github.com/avimehenwal/secops-telemetry-ingestion/apps/telemetryprocessor/internal/config"
 	"github.com/avimehenwal/secops-telemetry-ingestion/apps/telemetryprocessor/internal/enrichment"
+	"github.com/avimehenwal/secops-telemetry-ingestion/apps/telemetryprocessor/internal/logging"
 )
 
 func main() {
-	logger := log.New(os.Stdout, "", log.LstdFlags|log.LUTC)
+	env := config.Environment()
+	format := logging.ResolveFormat(os.Getenv("LOG_FORMAT"), config.IsLocal(env))
+	root := logging.New(os.Stdout, logLevel(), format, env)
+	logger := logging.Component(root, logging.ComponentApp)
+	enrichmentLog := logging.Component(root, logging.ComponentUpstreamEnrichment)
+	analyticsLog := logging.Component(root, logging.ComponentUpstreamAnalytics)
 
 	cfg, err := config.Load()
 	if err != nil {
-		logger.Fatalf("configuration error: %v", err)
+		logger.Error("configuration error", "error", err.Error())
+		os.Exit(1)
 	}
 
 	analyticsClient := analytics.NewClient(cfg.AnalyticsURL, cfg.APIKey, analytics.Options{
@@ -30,7 +38,7 @@ func main() {
 		RateRequests: cfg.AnalyticsRateRequests,
 		RateWindow:   cfg.AnalyticsRateWindow,
 		MaxRetries:   cfg.AnalyticsMaxRetries,
-		Logger:       logger,
+		Logger:       analyticsLog,
 	})
 
 	batcher := analytics.NewBatcher(analyticsClient.SendBatch, analytics.BatcherOptions{
@@ -38,7 +46,7 @@ func main() {
 		MaxFillWait: cfg.AnalyticsMaxFillWait,
 		QueueSize:   cfg.AnalyticsQueueSize,
 		DrainGrace:  cfg.AnalyticsDrainGrace,
-		Logger:      logger,
+		Logger:      analyticsLog,
 	})
 	batcherCtx, stopBatcher := context.WithCancel(context.Background())
 	defer stopBatcher()
@@ -52,7 +60,7 @@ func main() {
 			BackoffMax:       cfg.EnrichmentBackoffMax,
 			BreakerThreshold: cfg.EnrichmentBreakerThreshold,
 			BreakerCooldown:  cfg.EnrichmentBreakerCooldown,
-			Logger:           logger,
+			Logger:           enrichmentLog,
 		}),
 		Analytics: batcher,
 		Logger:    logger,
@@ -81,23 +89,43 @@ func main() {
 	defer stop()
 
 	go func() {
-		logger.Printf("telemetryprocessor listening on %s (enrichment=%s analytics=%s, rate=%d req/%s, batch=%d)",
-			cfg.Addr, cfg.EnrichmentURL, cfg.AnalyticsURL, cfg.AnalyticsRateRequests, cfg.AnalyticsRateWindow, cfg.AnalyticsBatchSize)
+		logger.Info("telemetryprocessor listening",
+			"logFormat", string(format),
+			"addr", cfg.Addr,
+			"enrichmentURL", cfg.EnrichmentURL,
+			"analyticsURL", cfg.AnalyticsURL,
+			"rateRequests", cfg.AnalyticsRateRequests,
+			"rateWindow", cfg.AnalyticsRateWindow.String(),
+			"batchSize", cfg.AnalyticsBatchSize)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			logger.Fatalf("server error: %v", err)
+			logger.Error("server error", "error", err.Error())
+			os.Exit(1)
 		}
 	}()
 
 	<-ctx.Done()
-	logger.Println("shutdown signal received, draining connections...")
+	logger.Info("shutdown signal received, draining connections")
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
-		logger.Printf("graceful shutdown failed: %v", err)
+		logger.Error("graceful shutdown failed", "error", err.Error())
 	}
 
 	stopBatcher()
 	batcher.Wait()
-	logger.Println("stopped")
+	logger.Info("stopped")
+}
+
+func logLevel() slog.Level {
+	switch strings.ToLower(os.Getenv("LOG_LEVEL")) {
+	case "debug":
+		return slog.LevelDebug
+	case "warn", "warning":
+		return slog.LevelWarn
+	case "error":
+		return slog.LevelError
+	default:
+		return slog.LevelInfo
+	}
 }

@@ -3,7 +3,7 @@ package analytics
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"time"
 
 	"github.com/avimehenwal/secops-telemetry-ingestion/apps/telemetryprocessor/internal/model"
@@ -18,7 +18,7 @@ type Batcher struct {
 	drainGrace  time.Duration
 	sendBatch   func(context.Context, []model.AnalyticsEvent) (int, error)
 	stopped     chan struct{}
-	logger      *log.Logger
+	logger      *slog.Logger
 }
 
 // submission is one event plus the channel its submitter is waiting on.
@@ -32,7 +32,7 @@ type BatcherOptions struct {
 	MaxFillWait time.Duration // how long a partial batch waits for company
 	QueueSize   int           // events buffered before Submit applies backpressure
 	DrainGrace  time.Duration // budget for delivering what is queued at shutdown
-	Logger      *log.Logger   // optional; each flush is logged here
+	Logger      *slog.Logger  // optional; each flush is logged here
 }
 
 func NewBatcher(sendBatch func(context.Context, []model.AnalyticsEvent) (int, error), opts BatcherOptions) *Batcher {
@@ -48,6 +48,10 @@ func NewBatcher(sendBatch func(context.Context, []model.AnalyticsEvent) (int, er
 	if opts.DrainGrace <= 0 {
 		opts.DrainGrace = 30 * time.Second
 	}
+	logger := opts.Logger
+	if logger == nil {
+		logger = slog.New(slog.DiscardHandler)
+	}
 	return &Batcher{
 		queue:       make(chan submission, opts.QueueSize),
 		batchSize:   opts.BatchSize,
@@ -55,13 +59,7 @@ func NewBatcher(sendBatch func(context.Context, []model.AnalyticsEvent) (int, er
 		drainGrace:  opts.DrainGrace,
 		sendBatch:   sendBatch,
 		stopped:     make(chan struct{}),
-		logger:      opts.Logger,
-	}
-}
-
-func (b *Batcher) logf(format string, args ...any) {
-	if b.logger != nil {
-		b.logger.Printf(format, args...)
+		logger:      logger,
 	}
 }
 
@@ -142,9 +140,16 @@ func (b *Batcher) flush(ctx context.Context, batch []submission) {
 	start := time.Now()
 	ingested, err := b.sendBatch(ctx, events)
 	if err != nil {
-		b.logf("analytics batch sent: size=%d ingested=%d duration=%s error=%v", len(batch), ingested, time.Since(start), err)
+		b.logger.Error("batch delivery failed",
+			"size", len(batch),
+			"ingested", ingested,
+			"durationMs", time.Since(start).Milliseconds(),
+			"error", err.Error())
 	} else {
-		b.logf("analytics batch sent: size=%d ingested=%d duration=%s", len(batch), ingested, time.Since(start))
+		b.logger.Info("batch delivered",
+			"size", len(batch),
+			"ingested", ingested,
+			"durationMs", time.Since(start).Milliseconds())
 	}
 
 	if err == nil && ingested < len(batch) {

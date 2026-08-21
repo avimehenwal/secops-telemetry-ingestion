@@ -349,9 +349,24 @@ func progressLine(start time.Time, total int, ev ingestResult) string {
 		eta = 0
 	}
 
-	return fmt.Sprintf("  [%*d/%d] %5.1f%% | enriched %d | elapsed %s | eta %s",
-		width, ev.Ingested, total, pct, ev.Enriched,
-		elapsed.Round(estimateRounding), eta.Round(estimateRounding))
+	return fmt.Sprintf("  [%*d/%d] %5.1f%% | enriched %*d | elapsed %s | eta %s",
+		width, ev.Ingested, total, pct, width, ev.Enriched,
+		formatDuration(elapsed), formatDuration(eta))
+}
+
+func formatDuration(d time.Duration) string {
+	d = d.Round(estimateRounding)
+	if d < 0 {
+		d = 0
+	}
+	total := int64(d / time.Second)
+	h := total / 3600
+	m := (total % 3600) / 60
+	s := total % 60
+	if h > 0 {
+		return fmt.Sprintf("%d:%02d:%02d", h, m, s)
+	}
+	return fmt.Sprintf("%02d:%02d", m, s)
 }
 
 type ingestStats struct {
